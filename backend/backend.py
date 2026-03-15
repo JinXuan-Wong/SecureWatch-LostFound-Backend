@@ -35,6 +35,7 @@ from fastapi import Query
 from pydantic import BaseModel
 
 # Local imports
+ENABLE_HEAVY_PIPELINE = os.getenv("ENABLE_HEAVY_PIPELINE", "false").lower() == "true"
 try:
     lf = None
     if ENABLE_HEAVY_PIPELINE:
