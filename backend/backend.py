@@ -35,13 +35,9 @@ from fastapi import Query
 from pydantic import BaseModel
 
 # Local imports
-ENABLE_HEAVY_PIPELINE = os.getenv("ENABLE_HEAVY_PIPELINE", "false").lower() == "true"
 try:
-    lf = None
-    LiveHub = None
-    if ENABLE_HEAVY_PIPELINE:
-        import lostandfound as lf
-        from backend.live_hub import LiveHub
+    from lostfound_backend import lostandfound as lf
+    from lostfound_backend.backend.live_hub import LiveHub
 except ModuleNotFoundError:
     import lostandfound as lf
     from backend.live_hub import LiveHub
@@ -119,7 +115,7 @@ _analyze_queued: Set[str] = set()
 OFFLINE_LOCKS = defaultdict(threading.Lock)
 
 # Live components
-hub = LiveHub() if ENABLE_HEAVY_PIPELINE and LiveHub is not None else None
+hub = LiveHub()
 pipelines_live: Dict[str, Any] = {}
 pipelines_settings: Dict[str, Any] = {}
 pipelines: Dict[str, Any] = {}
@@ -2082,8 +2078,7 @@ def live_pump() -> None:
                             v["dets"] = []
                             v["detections"] = []
                             v["detection_enabled"] = False
-                        if hub is None:
-                             return {"ok": False, "message": "Live hub disabled in cloud mode"}
+
                         hub.update(cam_id, views_payload, lost_items=[])
                     except Exception as e:
                         _system(f"Error processing disabled detection for {cam_id}: {e}")
@@ -2224,9 +2219,6 @@ def live_pump() -> None:
                 # if camera off, no lost items
                 if not cam_on:
                     lost_items = []
-                
-                if hub is None:
-                    return {"ok": False, "message": "Live hub disabled in cloud mode"}
 
                 # Update hub
                 hub.update(cam_id, views_payload, lost_items=lost_items)
@@ -2650,53 +2642,54 @@ def queue_analyze_if_needed(stem: str) -> None:
 # ============================================================
 # FastAPI App Setup
 # ============================================================
-ENABLE_HEAVY_PIPELINE = os.getenv("ENABLE_HEAVY_PIPELINE", "false").lower() == "true"
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     def boot_job():
-        try:
-            _system("Startup: scanning upload/ for non-h264 videos (auto-convert)...")
-            _startup_scan_upload_folder()
+        _system("Startup: scanning upload/ for non-h264 videos (auto-convert)...")
+        _startup_scan_upload_folder()
 
-            _system("Startup: scanning offline_upload (manifest + auto-convert missing h264)...")
-            _startup_scan_offline_folder()
+        _system("Startup: scanning offline_upload (manifest + auto-convert missing h264)...")
+        _startup_scan_offline_folder()
 
-            _system("Startup: scanning uploads for fisheye grid (non-blocking)...")
-            files = list_upload_videos_h264_only()
-            _system(f"Startup: found {len(files)} h264 uploads")
-            for f in files:
-                stem = f.stem
-                hasA, hasB = grid_ready_for_groups(stem)
-                if hasA and hasB:
-                    continue
-                try:
-                    if detect_video_type_cached(stem, f) == "fisheye":
-                        trigger_grid_async(stem)
-                except Exception:
-                    pass
-        except Exception as e:
-            _system(f"Startup: boot_job failed err={e}")
-            traceback.print_exc()
+        _system("Startup: scanning uploads for fisheye grid (non-blocking)...")
+        files = list_upload_videos_h264_only()
+        _system(f"Startup: found {len(files)} h264 uploads")
+        for f in files:
+            stem = f.stem
+            hasA, hasB = grid_ready_for_groups(stem)
+            if hasA and hasB:
+                continue
+            try:
+                if detect_video_type_cached(stem, f) == "fisheye":
+                    trigger_grid_async(stem)
+            except Exception:
+                pass
 
+    # Update the live_boot function to initialize detection config
     def live_boot():
         """Start live pipelines and monitoring"""
         try:
             _system("Startup: starting LIVE pipelines (detection)...")
             start_live_pipelines(limit_normal=999, limit_fisheye=999)
 
+            # Initialize detection config from pipelines
             init_detection_config_from_pipelines()
 
+            # Set pipelines to use LIVE pipelines as source of truth
             global pipelines
             pipelines = pipelines_live
 
+            # Start background threads
             threading.Thread(target=live_pump, daemon=True).start()
             threading.Thread(target=live_auto_toggle_fisheye, daemon=True).start()
+
+            # START THE VIDEO MONITOR THREAD
             threading.Thread(target=monitor_live_videos_loop, daemon=True).start()
 
             _system(f"LIVE pipelines started: {len(pipelines_live)} cameras")
             _system("LIVE video monitor started")
 
+            # Log cache stats
             with _video_type_cache_lock:
                 _system(f"Video type cache initialized with {len(_video_type_cache)} entries")
 
@@ -2704,19 +2697,16 @@ async def lifespan(app: FastAPI):
             _system(f"Startup: LIVE failed err={e}")
             traceback.print_exc()
 
-    # always allow light startup
+    # ✅ STARTUP (this is what you missed)
     threading.Thread(target=boot_job, daemon=True).start()
-
-    # only allow heavy startup when explicitly enabled
-    if ENABLE_HEAVY_PIPELINE:
-        _system("Startup: heavy pipeline ENABLED")
-        threading.Thread(target=live_boot, daemon=True).start()
-    else:
-        _system("Startup: heavy pipeline DISABLED (cloud-safe mode)")
+    threading.Thread(target=live_boot, daemon=True).start()
 
     yield
 
+    # ✅ SHUTDOWN
     _system("Shutdown: backend stopping")
+
+
 # =========================================================
 # Stability / Watchdog / Auto-Restart
 # =========================================================
@@ -2848,7 +2838,7 @@ def live_watchdog_loop():
 # ============================================================
 # FastAPI Application
 # ============================================================
-app = FastAPI(title="Lost & Found Backend", version="2.0.0")
+app = FastAPI(title="Lost & Found Backend", version="2.0.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
