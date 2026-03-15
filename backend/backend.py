@@ -35,18 +35,27 @@ from fastapi import Query
 from pydantic import BaseModel
 
 # Local imports
+# ENABLE_HEAVY_PIPELINE = os.getenv("ENABLE_HEAVY_PIPELINE", "false").lower() == "true"
+# try:
+#     lf = None
+#     LiveHub = None
+#     if ENABLE_HEAVY_PIPELINE:
+#         import lostandfound as lf
+#         from backend.live_hub import LiveHub
+# except ModuleNotFoundError:
+#     import lostandfound as lf
+#     from backend.live_hub import LiveHub
+# import re, datetime
 ENABLE_HEAVY_PIPELINE = os.getenv("ENABLE_HEAVY_PIPELINE", "false").lower() == "true"
-try:
-    lf = None
-    LiveHub = None
-    if ENABLE_HEAVY_PIPELINE:
-        import lostandfound as lf
-        from lostfound_backend.backend.live_hub import LiveHub
-except ModuleNotFoundError:
+
+lf = None
+LiveHub = None
+
+if ENABLE_HEAVY_PIPELINE:
     import lostandfound as lf
     from backend.live_hub import LiveHub
-import re, datetime
 
+import re, datetime
 
 # ============================================================
 # Configuration and Constants
@@ -2848,7 +2857,7 @@ def live_watchdog_loop():
 # ============================================================
 # FastAPI Application
 # ============================================================
-app = FastAPI(title="Lost & Found Backend", version="2.0.0", lifespan=lifespan)
+app = FastAPI(title="Lost & Found Backend", version="2.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
