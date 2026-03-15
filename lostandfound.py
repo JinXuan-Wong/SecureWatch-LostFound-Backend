@@ -32,7 +32,7 @@ LOSTFOUND_BACKEND_DIR = CURRENT_FILE.parents[1]
 #  SET YOUR VIDEO PATH HERE
 # ---------------------------------------------------------
 # VIDEO_PATH = r"D:\20251110081000-20251110084059\B100D_B_Block_B_Block_20251110081000_20251110084058_39454624.mp4"
-VIDEO_PATH = r"D:\DrTew\SecureWatch by QingYing JinXuan\Videos\B001G_B_Block_B_Block_20251110080959_20251110083105_39454534.mp4"
+# VIDEO_PATH = r"D:\DrTew\SecureWatch by QingYing JinXuan\Videos\B001G_B_Block_B_Block_20251110080959_20251110083105_39454534.mp4"
 # VIDEO_PATH = r"D:\20251110081000-20251110084059\B001G_B_Block_B_Block_20251110083105_20251110084059_39975898.mp4"
 # ---------------------------------------------------------
 
@@ -134,11 +134,11 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 # Your trained items model
-WEIGHTS_ITEMS = r"D:\DrTew\SecureWatch by QingYing JinXuan\SecureWatch\lostfound_backend\runs\lostandfound_global_v2\weights\best.pt"
+WEIGHTS_ITEMS = r"runs/lostandfound_global_v2/weights/best.pt"
 print("ITEM WEIGHTS EXISTS?", os.path.exists(WEIGHTS_ITEMS), WEIGHTS_ITEMS)
 
 # COCO model for person (light + fast)
-WEIGHTS_PERSON = "D:\DrTew\SecureWatch by QingYing JinXuan\SecureWatch\lostfound_backend\yolov8x.pt"
+WEIGHTS_PERSON = "yolov8x.pt"
 
 COCO_PERSON_CLASS_ID = 0        # in COCO, person == 0
 PERSON_NAME = "person"

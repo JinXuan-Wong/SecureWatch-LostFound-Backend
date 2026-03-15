@@ -28,9 +28,11 @@ import cv2
 import numpy as np
 import lostandfound as lf
 
-FISHEYE_CFG_STORE = (
-    r"D:\DrTew\SecureWatch by QingYing JinXuan\SecureWatch"
-    r"\lostfound_backend\backend\outputs\lost_and_found\fisheye_view_configs.json"
+FISHEYE_CFG_STORE = os.path.join(
+    "backend",
+    "outputs",
+    "lost_and_found",
+    "fisheye_view_configs.json"
 )
 
 
@@ -2699,7 +2701,7 @@ class VideoPipeline:
 # ---------------------------------------------------------
 # ONE DB file for all camera ROI configs
 # ---------------------------------------------------------
-MULTI_ROI_FILE = r"D:\DrTew\SecureWatch by QingYing JinXuan\SecureWatch\lostfound_backend\multivideo_roi_config.json"
+MULTI_ROI_FILE = "multivideo_roi_config.json"
 
 
 def _load_multi_roi_db(path: str) -> dict:
@@ -2906,7 +2908,7 @@ def main():
             camera_id=cam_id,
             src=src,
             roi_config_path=cam_roi_paths[cam_id],
-            fisheye_config_path=r"D:\DrTew\SecureWatch by QingYing JinXuan\SecureWatch\lostfound_backend\backend\outputs\lost_and_found\fisheye_view_configs.json",
+            fisheye_config_path=FISHEYE_CFG_STORE,
             show_ui=True,
             source_kind="RTSP",
             desired_fps_fisheye=4.0,
