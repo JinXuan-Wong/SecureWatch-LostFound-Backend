@@ -36,8 +36,10 @@ from pydantic import BaseModel
 
 # Local imports
 try:
-    from lostfound_backend import lostandfound as lf
-    from lostfound_backend.backend.live_hub import LiveHub
+    lf = None
+    if ENABLE_HEAVY_PIPELINE:
+        import lostandfound as lf
+        from lostfound_backend.backend.live_hub import LiveHub
 except ModuleNotFoundError:
     import lostandfound as lf
     from backend.live_hub import LiveHub
