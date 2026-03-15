@@ -1,0 +1,23 @@
+path: C:/Users/admin/Documents/LostAnd/balanced_merged_dataset
+train: images/train
+val: images/val
+
+nc: 17
+names:
+  0: backpack
+  1: handbag
+  2: watch
+  3: laptop
+  4: tablet
+  5: mobile_phone
+  6: earphones
+  7: powerbank
+  8: water_bottle
+  9: umbrella
+  10: usb_drive
+  11: wallet
+  12: card
+  13: key
+  14: headphone
+  15: charger_adapter
+  16: spectacles

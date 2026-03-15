@@ -1,0 +1,82 @@
+[
+  {
+    "view_id": 0,
+    "name": "middle_row",
+    "yaw": 100,
+    "pitch": 2,
+    "fov": 120,
+    "rotate": 270,
+    "group": "A",
+    "local_id": 0
+  },
+  {
+    "view_id": 1,
+    "name": "front_right_row",
+    "yaw": 75,
+    "pitch": 42,
+    "fov": 65,
+    "rotate": 270,
+    "group": "A",
+    "local_id": 1
+  },
+  {
+    "view_id": 2,
+    "name": "front_left_row",
+    "yaw": 6.0,
+    "pitch": 44.0,
+    "fov": 63.0,
+    "rotate": 270,
+    "group": "A",
+    "local_id": 2
+  },
+  {
+    "view_id": 3,
+    "name": "back_right_row",
+    "yaw": 180,
+    "pitch": 47,
+    "fov": 49,
+    "rotate": 270,
+    "group": "A",
+    "local_id": 3
+  },
+  {
+    "view_id": 4,
+    "name": "back_left_row",
+    "yaw": 265,
+    "pitch": 35,
+    "fov": 66,
+    "rotate": 270,
+    "group": "B",
+    "local_id": 0
+  },
+  {
+    "view_id": 5,
+    "name": "back_row",
+    "yaw": 333.0,
+    "pitch": 140.0,
+    "fov": 60.0,
+    "rotate": 270,
+    "group": "B",
+    "local_id": 1
+  },
+  {
+    "view_id": 6,
+    "name": "front_row",
+    "yaw": 240.0,
+    "pitch": 35.0,
+    "fov": 76.0,
+    "rotate": 270,
+    "group": "B",
+    "local_id": 2
+  },
+  {
+    "view_id": 7,
+    "name": "corridor",
+    "yaw": 72,
+    "pitch": 17,
+    "fov": 115,
+    "rotate": 270,
+    "group": "B",
+    "local_id": 3
+  }
+]

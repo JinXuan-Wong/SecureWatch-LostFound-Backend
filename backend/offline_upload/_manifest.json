@@ -1,0 +1,38 @@
+{
+  "videos": {
+    "B001G_B_Block_B_Block_20251110080959_20251110083105_39454534": {
+      "name": "B001G_B_Block_B_Block_20251110080959_20251110083105_39454534.mp4",
+      "size": "210 MB",
+      "uploadDate": 1769686044,
+      "status": "ready",
+      "h264_ready": true,
+      "h264_name": "B001G_B_Block_B_Block_20251110080959_20251110083105_39454534_h264.mp4",
+      "roi_ready": true,
+      "error": null,
+      "source": "offline",
+      "duration": "00:01:30"
+    },
+    "B100D_B_Block_B_Block_20251110081000_20251110084058_39454624": {
+      "name": "B100D_B_Block_B_Block_20251110081000_20251110084058_39454624.mp4",
+      "size": "516 MB",
+      "uploadDate": 1770212958,
+      "h264_name": "B100D_B_Block_B_Block_20251110081000_20251110084058_39454624_h264.mp4",
+      "h264_ready": true,
+      "roi_ready": true,
+      "status": "ready",
+      "error": null,
+      "duration": "00:30:57"
+    },
+    "B001G_B_Block_B_Block_20251110083105_20251110084059_39975898": {
+      "name": "B001G_B_Block_B_Block_20251110083105_20251110084059_39975898.mp4",
+      "size": "95 MB",
+      "uploadDate": 1773162294,
+      "h264_name": "B001G_B_Block_B_Block_20251110083105_20251110084059_39975898_h264.mp4",
+      "h264_ready": true,
+      "roi_ready": true,
+      "status": "ready",
+      "error": null,
+      "duration": "00:09:54"
+    }
+  }
+}
