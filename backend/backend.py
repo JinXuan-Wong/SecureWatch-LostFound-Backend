@@ -1696,12 +1696,12 @@ def restart_single_live_camera(cam_id: str) -> bool:
                 camera_id=cam_id,
                 src=src,
                 roi_config_path=str(roi_path),
-                num_workers=1,
-                max_skip=1,
-                desired_fps_fisheye=10.0,
-                desired_fps_normal=10.0,
+                num_workers=2,
+                max_skip=2,
+                desired_fps_fisheye=5.0,
+                desired_fps_normal=5.0,
                 window_scale=0.80,
-                display_fps=25.0,
+                display_fps=10.0,
                 show_ui=False,
                 enable_detection=detection_enabled,
                 force_video_type=forced_video_type,
@@ -1878,12 +1878,12 @@ def start_live_pipelines(limit_normal: int = 999, limit_fisheye: int = 999):
                 camera_id=cam_id,
                 src=str(f),
                 roi_config_path=str(roi_path),
-                num_workers=1,
-                max_skip=1,
-                desired_fps_fisheye=10.0,
-                desired_fps_normal=10.0,
+                num_workers=2,
+                max_skip=2,
+                desired_fps_fisheye=5.0,
+                desired_fps_normal=5.0,
                 window_scale=0.80,
-                display_fps=25.0,
+                display_fps=10.0,
                 show_ui=False,
                 enable_detection=True,
 
@@ -1914,12 +1914,12 @@ def start_live_pipelines(limit_normal: int = 999, limit_fisheye: int = 999):
                 camera_id=cam_id,
                 src=rec["url"],
                 roi_config_path=str(roi_path),
-                num_workers=1,
-                max_skip=1,
-                desired_fps_fisheye=10.0,
-                desired_fps_normal=10.0,
+                num_workers=2,
+                max_skip=2,
+                desired_fps_fisheye=5.0,
+                desired_fps_normal=5.0,
                 window_scale=0.80,
-                display_fps=25.0,
+                display_fps=10.0,
                 show_ui=False,
                 enable_detection=True,
 
@@ -5457,7 +5457,7 @@ def live_mjpeg_dashboard(cam_id: str, group: str):
 
     overlay = _dashboard_overlay_flag()  # kept for clarity / future use
 
-    FPS = 12.0
+    FPS = 4.0
     FRAME_DT = 1.0 / FPS
     STALE_OK_SEC = 2.0
 
@@ -5578,6 +5578,7 @@ def live_mjpeg(cam_id: str, group: str, overlay: int = Query(1)):
       - 1 => allow overlay (ROI/dets if your rendering adds them)
       - 0 => raw (no ROI) (we force slow-path raw frame for NORMAL)
     """
+    
     cam_id = _live_id(cam_id)
 
     g = (group or "A").upper().strip()
@@ -5586,7 +5587,7 @@ def live_mjpeg(cam_id: str, group: str, overlay: int = Query(1)):
 
     overlay = 1 if int(overlay) == 1 else 0
 
-    FPS = 12.0
+    FPS = 2.0
     FRAME_DT = 1.0 / FPS
     STALE_OK_SEC = 2.0
 
@@ -5863,6 +5864,57 @@ def live_mjpeg(cam_id: str, group: str, overlay: int = Query(1)):
         },
     )
 
+@app.get("/api/live/dashboard_frame/{cam_id}/{group}")
+def live_dashboard_frame(cam_id: str, group: str):
+    cam_id = _live_id(cam_id)
+
+    g = (group or "A").upper().strip()
+    if g not in ("A", "B", "0"):
+        g = "A"
+
+    no_cache_headers = {
+        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+        "Pragma": "no-cache",
+    }
+
+    p = pipelines_live.get(cam_id)
+    if p is None:
+        return Response(status_code=204, headers=no_cache_headers)
+
+    try:
+        jpg = None
+
+        # Primary source
+        if hasattr(p, "pull_dashboard_jpg"):
+            jpg = p.pull_dashboard_jpg(g)
+
+        # Fallback 1: fisheye clean grid
+        if not jpg:
+            if bool(getattr(p, "is_fisheye", False)):
+                gg = "B" if g == "B" else "A"
+                if hasattr(p, "pull_group_grid_jpg_clean"):
+                    jpg = p.pull_group_grid_jpg_clean(gg)
+
+        # Fallback 2: normal single clean frame
+        if not jpg:
+            if not bool(getattr(p, "is_fisheye", False)):
+                if hasattr(p, "pull_single_view_jpg_clean"):
+                    jpg = p.pull_single_view_jpg_clean(0)
+
+        # Still no real frame -> tell frontend this frame is unavailable
+        if not jpg:
+            return Response(status_code=204, headers=no_cache_headers)
+
+        return Response(
+            content=jpg,
+            media_type="image/jpeg",
+            headers=no_cache_headers,
+        )
+
+    except Exception as e:
+        print(f"[dashboard_frame] cam={cam_id} group={g} failed: {e}")
+        return Response(status_code=204, headers=no_cache_headers)
+    
 
 @app.post("/api/settings/clear_static_cache")
 def clear_static_cache():
@@ -6769,10 +6821,143 @@ def _get_rtsp_entry(cam_id: str) -> Optional[Dict[str, str]]:
 # ============================================================
 # FISHEYE VIEW CONFIG STORE (yaw/pitch/fov/rotate per camera)
 # ============================================================
+import threading
+import time
+import json
+import cv2
+from typing import Dict, Any
+from fastapi import Body, HTTPException, Query
+from fastapi.responses import Response
+
 FISHEYE_CFG_PATH = OUTPUTS_LF_DIR / "fisheye_view_configs.json"
 FISHEYE_CFG_PATH.parent.mkdir(parents=True, exist_ok=True)
 
+_fisheye_preview_lock_map: Dict[str, threading.Lock] = {}
+_fisheye_preview_lock_map_guard = threading.Lock()
+_fisheye_preview_last_ts: Dict[str, float] = {}
+_fisheye_preview_min_gap_sec = 0.10
 
+
+def _get_fisheye_preview_lock(cam_id: str) -> threading.Lock:
+    cam_id = (cam_id or "").strip()
+    with _fisheye_preview_lock_map_guard:
+        lk = _fisheye_preview_lock_map.get(cam_id)
+        if lk is None:
+            lk = threading.Lock()
+            _fisheye_preview_lock_map[cam_id] = lk
+        return lk
+
+
+def _safe_float(v, default=0.0):
+    try:
+        if v is None:
+            return float(default)
+        if isinstance(v, str) and not v.strip():
+            return float(default)
+        return float(v)
+    except Exception:
+        return float(default)
+
+
+def _safe_int(v, default=0):
+    try:
+        if v is None:
+            return int(default)
+        if isinstance(v, str) and not v.strip():
+            return int(default)
+        return int(float(v))
+    except Exception:
+        return int(default)
+
+
+def _default_fisheye_configs() -> list:
+    return json.loads(json.dumps(FISHEYE_VIEW_CONFIGS))
+
+
+def load_fisheye_view_configs_all() -> Dict[str, Any]:
+    try:
+        if FISHEYE_CFG_PATH.exists():
+            return json.loads(FISHEYE_CFG_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return {}
+
+
+def save_fisheye_view_configs_all(data: Dict[str, Any]) -> None:
+    FISHEYE_CFG_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+
+def get_fisheye_view_configs(cam_id: str) -> list:
+    cam_id = (cam_id or "").strip()
+    if not cam_id:
+        return _default_fisheye_configs()
+
+    allcfg = load_fisheye_view_configs_all()
+    cfg = allcfg.get(cam_id)
+
+    if isinstance(cfg, list) and len(cfg) >= 1:
+        out = []
+        for i, rec in enumerate(cfg):
+            if not isinstance(rec, dict):
+                continue
+            out.append({
+                "view_id": _safe_int(rec.get("view_id", i), i),
+                "name": str(rec.get("name", f"view_{i}")),
+                "yaw": _safe_float(rec.get("yaw", 0.0), 0.0),
+                "pitch": _safe_float(rec.get("pitch", 0.0), 0.0),
+                "fov": _safe_float(rec.get("fov", 90.0), 90.0),
+                "rotate": _safe_int(rec.get("rotate", 0), 0),
+            })
+        if out:
+            return out
+
+    return _default_fisheye_configs()
+
+
+def set_fisheye_view_configs(cam_id: str, cfg_list: list) -> None:
+    cam_id = (cam_id or "").strip()
+    if not cam_id:
+        raise ValueError("cam_id required")
+
+    if not isinstance(cfg_list, list) or len(cfg_list) == 0:
+        raise ValueError("cfg_list must be a list")
+
+    out = []
+    for i, rec in enumerate(cfg_list):
+        if not isinstance(rec, dict):
+            continue
+
+        out.append({
+            "view_id": _safe_int(rec.get("view_id", i), i),
+            "name": str(rec.get("name", f"view_{i}")),
+            "yaw": _safe_float(rec.get("yaw", 0.0), 0.0),
+            "pitch": _safe_float(rec.get("pitch", 0.0), 0.0),
+            "fov": _safe_float(rec.get("fov", 90.0), 90.0),
+            "rotate": _safe_int(rec.get("rotate", 0), 0),
+        })
+
+    if not out:
+        raise ValueError("no valid config records")
+
+    allcfg = load_fisheye_view_configs_all()
+    allcfg[cam_id] = out
+    save_fisheye_view_configs_all(allcfg)
+
+
+def reset_fisheye_view_configs(cam_id: str) -> None:
+    cam_id = (cam_id or "").strip()
+    if not cam_id:
+        raise ValueError("cam_id required")
+
+    allcfg = load_fisheye_view_configs_all()
+    if cam_id in allcfg:
+        del allcfg[cam_id]
+        save_fisheye_view_configs_all(allcfg)
+
+
+# ============================================================
+# FISHEYE CONFIG APIs
+# ============================================================
 @app.get("/api/lostfound/fisheye_configs/{cam_id}")
 def api_get_fisheye_config(cam_id: str):
     cam_id = (cam_id or "").strip()
@@ -6790,7 +6975,9 @@ def api_set_fisheye_config(cam_id: str, payload: Dict[str, Any] = Body(...)):
     try:
         set_fisheye_view_configs(cam_id, cfg)
     except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        print(f"[ERROR] fisheye config save failed cam={cam_id}: {e}")
+        print(f"[ERROR] payload={payload}")
+        raise HTTPException(status_code=400, detail=f"invalid fisheye config: {e}")
 
     # clear fallback/static preprocessor caches
     try:
@@ -6805,16 +6992,15 @@ def api_set_fisheye_config(cam_id: str, payload: Dict[str, Any] = Body(...)):
     except Exception:
         pass
 
-    # ✅ DO NOT restart live pipeline
-    # ✅ tell running pipeline to reload immediately
+    # fast apply in running pipeline (do NOT restart while editing)
     try:
         p = pipelines_live.get(cam_id)
         if p is not None:
             setattr(p, "_fisheye_cfg_dirty", True)
             if hasattr(p, "reload_fisheye_config"):
                 p.reload_fisheye_config()
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[WARN] fisheye live apply failed cam={cam_id}: {e}")
 
     return {"ok": True, "cam_id": cam_id, "applied": True}
 
@@ -6846,8 +7032,8 @@ def api_reset_fisheye_config(cam_id: str):
             setattr(p, "_fisheye_cfg_dirty", True)
             if hasattr(p, "reload_fisheye_config"):
                 p.reload_fisheye_config()
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[WARN] fisheye reset live apply failed cam={cam_id}: {e}")
 
     return {"ok": True, "cam_id": cam_id, "reset": True, "applied": True}
 
@@ -6855,12 +7041,12 @@ def api_reset_fisheye_config(cam_id: str):
 @app.get("/api/lostfound/fisheye_preview/{cam_id}/{view_idx}")
 def api_fisheye_preview(cam_id: str, view_idx: int, refresh: int = Query(1)):
     cam_id = (cam_id or "").strip()
+    if not cam_id:
+        raise HTTPException(status_code=400, detail="cam_id required")
 
     src = get_live_source(cam_id)
     if not src:
         raise HTTPException(status_code=404, detail="live source not found")
-
-    is_rtsp = str(src).lower().startswith(("rtsp://", "rtsps://"))
 
     try:
         cfgs = get_fisheye_view_configs(cam_id)
@@ -6870,16 +7056,13 @@ def api_fisheye_preview(cam_id: str, view_idx: int, refresh: int = Query(1)):
     if not isinstance(cfgs, list) or len(cfgs) == 0:
         raise HTTPException(status_code=500, detail="fisheye config empty")
 
-    # ✅ sort by REAL backend view_id
     cfgs_sorted = sorted(
         [c for c in cfgs if isinstance(c, dict)],
         key=lambda x: int(x.get("view_id", 0))
     )
 
-    # clamp requested real view_id
     wanted_view_id = max(0, min(int(view_idx), 7))
 
-    # ✅ map by real view_id, not by _fisheye_order_names()
     wanted_cfg = None
     for rec in cfgs_sorted:
         try:
@@ -6897,236 +7080,153 @@ def api_fisheye_preview(cam_id: str, view_idx: int, refresh: int = Query(1)):
 
     wanted_name = str(wanted_cfg.get("name") or f"view_{wanted_view_id}")
 
-    pre = None
-    cap = None
+    lock = _get_fisheye_preview_lock(cam_id)
+    acquired = lock.acquire(timeout=1.5)
+    if not acquired:
+        raise HTTPException(status_code=429, detail="preview busy, try again")
+
     try:
-        pre = lf.FisheyePreprocessor(
-            view_configs=cfgs_sorted,
-            config_path=str(_ensure_roi_file("live", cam_id))
-        )
+        # small throttle so rapid typing doesn't hammer preview too hard
+        now = time.time()
+        last_ts = _fisheye_preview_last_ts.get(cam_id, 0.0)
+        dt = now - last_ts
+        if dt < _fisheye_preview_min_gap_sec:
+            time.sleep(_fisheye_preview_min_gap_sec - dt)
+        _fisheye_preview_last_ts[cam_id] = time.time()
 
-        if not pre.open(str(src)):
-            if is_rtsp:
-                raise RuntimeError("cannot open RTSP fisheye source")
-            raise RuntimeError("cannot open fisheye source")
+        # ==================================================
+        # FAST PATH: use running pipeline + cached raw frame
+        # ==================================================
+        p = pipelines_live.get(cam_id)
+        if p is not None and getattr(p, "is_fisheye", False):
+            try:
+                setattr(p, "_fisheye_cfg_dirty", True)
+                if hasattr(p, "reload_fisheye_config"):
+                    p.reload_fisheye_config()
+            except Exception as e:
+                print(f"[WARN] fisheye preview reload failed cam={cam_id}: {e}")
 
-        # ✅ use a separate capture only to grab one frame
-        cap = cv2.VideoCapture(str(src))
-        fr = _read_any_frame(cap)
+            raw_fr = None
+            try:
+                if hasattr(p, "_get_latest_raw_frame_copy"):
+                    raw_fr = p._get_latest_raw_frame_copy()
+            except Exception:
+                raw_fr = None
 
-        if fr is None:
-            raise HTTPException(status_code=404, detail="no frame")
+            pre = getattr(p, "preprocessor", None)
 
-        # ✅ call get_views BEFORE release
-        try:
-            views = pre.get_views(fr, allowed_names=[wanted_name])
-        except TypeError:
-            views = pre.get_views(fr)
-
-        chosen = None
-        for v in (views or []):
-            if (v.get("name") or "") == wanted_name:
-                chosen = v
-                break
-
-        # fallback by view_id if name mismatch
-        if chosen is None:
-            for v in (views or []):
+            if raw_fr is not None and pre is not None:
                 try:
-                    if int(v.get("view_id", -1)) == wanted_view_id:
-                        chosen = v
-                        break
-                except Exception:
-                    pass
+                    try:
+                        views = pre.get_views(raw_fr, allowed_names=[wanted_name])
+                    except TypeError:
+                        views = pre.get_views(raw_fr)
 
-        if chosen is None or chosen.get("image") is None:
-            raise HTTPException(
-                status_code=404,
-                detail=f"view missing: id={wanted_view_id}, name={wanted_name}"
+                    chosen = None
+
+                    for v in (views or []):
+                        if (v.get("name") or "") == wanted_name:
+                            chosen = v
+                            break
+
+                    if chosen is None:
+                        for v in (views or []):
+                            try:
+                                if int(v.get("view_id", -1)) == wanted_view_id:
+                                    chosen = v
+                                    break
+                            except Exception:
+                                pass
+
+                    if chosen is not None and chosen.get("image") is not None:
+                        img = chosen["image"].copy()
+                        img = _draw_label_bar(
+                            img,
+                            f"{wanted_view_id} {wanted_name.replace('_', ' ').title()}"
+                        )
+                        return Response(
+                            content=_jpg_bytes(img, quality=85),
+                            media_type="image/jpeg",
+                            headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"},
+                        )
+                except Exception as e:
+                    print(f"[WARN] fisheye preview fast-path failed cam={cam_id}: {e}")
+
+        # ==================================================
+        # FALLBACK PATH: open source once if cache not ready
+        # ==================================================
+        pre = None
+        cap = None
+        try:
+            pre = lf.FisheyePreprocessor(
+                view_configs=cfgs_sorted,
+                config_path=str(_ensure_roi_file("live", cam_id))
             )
 
-        img = chosen["image"].copy()
-        img = _draw_label_bar(img, f"{wanted_view_id} {wanted_name.replace('_', ' ').title()}")
+            if not pre.open(str(src)):
+                raise RuntimeError("cannot open fisheye source")
 
-        return Response(
-            content=_jpg_bytes(img, quality=85),
-            media_type="image/jpeg",
-            headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"},
-        )
+            cap = cv2.VideoCapture(str(src))
+            fr = _read_any_frame(cap)
+            if fr is None:
+                raise HTTPException(status_code=404, detail="no frame")
+
+            try:
+                views = pre.get_views(fr, allowed_names=[wanted_name])
+            except TypeError:
+                views = pre.get_views(fr)
+
+            chosen = None
+            for v in (views or []):
+                if (v.get("name") or "") == wanted_name:
+                    chosen = v
+                    break
+
+            if chosen is None:
+                for v in (views or []):
+                    try:
+                        if int(v.get("view_id", -1)) == wanted_view_id:
+                            chosen = v
+                            break
+                    except Exception:
+                        pass
+
+            if chosen is None or chosen.get("image") is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"view missing: id={wanted_view_id}, name={wanted_name}"
+                )
+
+            img = chosen["image"].copy()
+            img = _draw_label_bar(
+                img,
+                f"{wanted_view_id} {wanted_name.replace('_', ' ').title()}"
+            )
+
+            return Response(
+                content=_jpg_bytes(img, quality=85),
+                media_type="image/jpeg",
+                headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"},
+            )
+
+        finally:
+            try:
+                if cap is not None:
+                    cap.release()
+            except Exception:
+                pass
+            try:
+                if pre is not None:
+                    pre.release()
+            except Exception:
+                pass
 
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"fisheye preview failed: {e}")
     finally:
-        try:
-            if cap is not None:
-                cap.release()
-        except Exception:
-            pass
-        try:
-            if pre is not None:
-                pre.release()
-        except Exception:
-            pass
-
-
-def _default_fisheye_configs() -> list:
-    # Uses your current hardcoded defaults
-    return json.loads(json.dumps(FISHEYE_VIEW_CONFIGS))
-
-
-def load_fisheye_view_configs_all() -> Dict[str, Any]:
-    try:
-        if FISHEYE_CFG_PATH.exists():
-            return json.loads(FISHEYE_CFG_PATH.read_text(encoding="utf-8"))
-    except Exception:
-        pass
-    return {}
-
-
-def save_fisheye_view_configs_all(data: Dict[str, Any]) -> None:
-    FISHEYE_CFG_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
-
-
-def get_fisheye_view_configs(cam_id: str) -> list:
-    cam_id = (cam_id or "").strip()
-    if not cam_id:
-        return _default_fisheye_configs()
-
-    allcfg = load_fisheye_view_configs_all()
-    cfg = allcfg.get(cam_id)
-
-    # Must be list of 8 dicts
-    if isinstance(cfg, list) and len(cfg) >= 1:
-        # sanitize keys + types
-        out = []
-        for i, rec in enumerate(cfg):
-            if not isinstance(rec, dict):
-                continue
-            out.append({
-                "view_id": int(rec.get("view_id", i)),
-                "name": str(rec.get("name", f"view_{i}")),
-                "yaw": float(rec.get("yaw", 0.0)),
-                "pitch": float(rec.get("pitch", 0.0)),
-                "fov": float(rec.get("fov", 90.0)),
-                "rotate": int(rec.get("rotate", 0)),
-            })
-        if out:
-            return out
-
-    return _default_fisheye_configs()
-
-
-def set_fisheye_view_configs(cam_id: str, cfg_list: list) -> None:
-    cam_id = (cam_id or "").strip()
-    if not cam_id:
-        raise ValueError("cam_id required")
-
-    if not isinstance(cfg_list, list) or len(cfg_list) == 0:
-        raise ValueError("cfg_list must be a list")
-
-    # sanitize to list[dict]
-    out = []
-    for i, rec in enumerate(cfg_list):
-        if not isinstance(rec, dict):
-            continue
-        out.append({
-            "view_id": int(rec.get("view_id", i)),
-            "name": str(rec.get("name", f"view_{i}")),
-            "yaw": float(rec.get("yaw", 0.0)),
-            "pitch": float(rec.get("pitch", 0.0)),
-            "fov": float(rec.get("fov", 90.0)),
-            "rotate": int(rec.get("rotate", 0)),
-        })
-
-    allcfg = load_fisheye_view_configs_all()
-    allcfg[cam_id] = out
-    save_fisheye_view_configs_all(allcfg)
-
-
-def reset_fisheye_view_configs(cam_id: str) -> None:
-    cam_id = (cam_id or "").strip()
-    if not cam_id:
-        raise ValueError("cam_id required")
-    allcfg = load_fisheye_view_configs_all()
-    if cam_id in allcfg:
-        del allcfg[cam_id]
-        save_fisheye_view_configs_all(allcfg)
-
-
-# ============================================================
-# FISHEYE CONFIG APIs
-# ============================================================
-@app.get("/api/lostfound/fisheye_configs/{cam_id}")
-def api_get_fisheye_config(cam_id: str):
-    cam_id = (cam_id or "").strip()
-    return {"cam_id": cam_id, "configs": get_fisheye_view_configs(cam_id)}
-
-
-@app.post("/api/lostfound/fisheye_configs/{cam_id}")
-def api_set_fisheye_config(cam_id: str, payload: Dict[str, Any] = Body(...)):
-    cam_id = (cam_id or "").strip()
-    cfg = payload.get("configs")
-
-    if not isinstance(cfg, list):
-        raise HTTPException(status_code=400, detail="configs must be a list")
-
-    try:
-        set_fisheye_view_configs(cam_id, cfg)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-    # ✅ APPLY IMMEDIATELY:
-    # clear preprocessor caches so next frame uses new yaw/pitch/fov
-    try:
-        with _live_pre_lock:
-            _live_pre_cache.pop(cam_id, None)
-    except Exception:
-        pass
-    try:
-        with _live_rtsp_pre_lock:
-            _live_rtsp_pre_cache.pop(cam_id, None)
-    except Exception:
-        pass
-
-    # If live pipeline exists, restart it so dewarp updates everywhere (group grid etc.)
-    try:
-        if cam_id in pipelines_live:
-            restart_single_live_camera(cam_id)
-    except Exception:
-        pass
-
-    return {"ok": True, "cam_id": cam_id}
-
-
-@app.post("/api/lostfound/fisheye_configs/{cam_id}/reset")
-def api_reset_fisheye_config(cam_id: str):
-    cam_id = (cam_id or "").strip()
-    try:
-        reset_fisheye_view_configs(cam_id)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-    # Clear caches + restart if running
-    try:
-        with _live_pre_lock:
-            _live_pre_cache.pop(cam_id, None)
-    except Exception:
-        pass
-    try:
-        with _live_rtsp_pre_lock:
-            _live_rtsp_pre_cache.pop(cam_id, None)
-    except Exception:
-        pass
-    try:
-        if cam_id in pipelines_live:
-            restart_single_live_camera(cam_id)
-    except Exception:
-        pass
-
-    return {"ok": True, "cam_id": cam_id, "reset": True}
-
+        lock.release()
 
 # =========================================================
 # Force-quit shutdown handler
@@ -7250,3 +7350,76 @@ def get_upload_sources():
 
     out.sort(key=lambda x: (x["name"], x["id"]))
     return {"sources": out}
+
+    
+VIEW_MODE_OVERRIDE_LOCK = threading.Lock()
+VIEW_MODE_OVERRIDE_PATH = OUTPUTS_LF_DIR / "live_view_mode_overrides.json"
+VALID_VIEW_MODES = {"auto", "fisheye", "normal"}
+
+def _load_view_mode_overrides():
+    try:
+        if not VIEW_MODE_OVERRIDE_PATH.exists():
+            return {}
+
+        with open(VIEW_MODE_OVERRIDE_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        if isinstance(data, dict):
+            cleaned = {}
+            for k, v in data.items():
+                if isinstance(k, str) and isinstance(v, str) and v in VALID_VIEW_MODES:
+                    cleaned[k] = v
+            return cleaned
+
+        return {}
+    except Exception as e:
+        print(f"[SYSTEM] Failed to load live view mode overrides: {e}")
+        return {}
+
+def _save_view_mode_overrides(data):
+    try:
+        VIEW_MODE_OVERRIDE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = VIEW_MODE_OVERRIDE_PATH.with_suffix(".tmp")
+
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+
+        os.replace(tmp_path, VIEW_MODE_OVERRIDE_PATH)
+        return True
+    except Exception as e:
+        print(f"[SYSTEM] Failed to save live view mode overrides: {e}")
+        return False
+    
+@app.get("/api/live/view-mode-overrides")
+def get_live_view_mode_overrides():
+    with VIEW_MODE_OVERRIDE_LOCK:
+        data = _load_view_mode_overrides()
+    return data
+
+
+@app.post("/api/live/view-mode-overrides")
+def set_live_view_mode_overrides(payload: dict = Body(...)):
+    if not isinstance(payload, dict):
+        return {"ok": False, "error": "Payload must be an object"}
+
+    cleaned = {}
+    for k, v in payload.items():
+        if not isinstance(k, str):
+            continue
+        if not isinstance(v, str):
+            continue
+
+        key = k.replace("_h264", "").strip()
+        val = v.strip().lower()
+
+        if not key:
+            continue
+        if val not in VALID_VIEW_MODES:
+            continue
+
+        cleaned[key] = val
+
+    with VIEW_MODE_OVERRIDE_LOCK:
+        ok = _save_view_mode_overrides(cleaned)
+
+    return {"ok": ok, "count": len(cleaned), "overrides": cleaned}
