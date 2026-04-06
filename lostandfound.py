@@ -2893,6 +2893,9 @@ class YoloDetector:
         "backpack",
         "laptop",
         "handbag",
+        "headphone",
+        "charger_adapter",
+        "spectacles",
     }
 
     @staticmethod
@@ -3876,6 +3879,11 @@ class LostAndFoundManager:
 
         self.venue_code = "B001G_B_Block_B"
         self.id_gen = ScalableIDGenerator(venue_name=self.venue_code, config_path=LOSTFOUND_BACKEND_DIR/"config.json")
+        self.snapshot_dedupe_enabled = True
+        self.snapshot_dedupe_every = 60.0
+        self.snapshot_similarity_threshold = 0.92
+        self.snapshot_time_window_sec = 600.0  # 10 minutes
+        self._last_snapshot_dedupe_ts = 0.0
         
     @staticmethod
     def _center_xy(b):
@@ -3949,22 +3957,293 @@ class LostAndFoundManager:
         except Exception:
             return 1
 
-    def _crop_bbox(self, frame_bgr, bbox, pad=10):
+    def _crop_bbox(
+        self,
+        frame_bgr,
+        bbox,
+        pad_x=20,
+        pad_y=20,
+        min_w=120,
+        min_h=120,
+        square=False,
+        max_expand_ratio=2.5,
+    ):
         if frame_bgr is None or bbox is None:
             return None
-        h, w = frame_bgr.shape[:2]
-        x1, y1, x2, y2 = map(int, bbox)
 
-        x1 = max(0, min(w - 1, x1 - pad))
-        y1 = max(0, min(h - 1, y1 - pad))
-        x2 = max(0, min(w, x2 + pad))
-        y2 = max(0, min(h, y2 + pad))
+        h, w = frame_bgr.shape[:2]
+        x1, y1, x2, y2 = map(float, bbox)
+
+        bw = max(1.0, x2 - x1)
+        bh = max(1.0, y2 - y1)
+
+        # adaptive expansion but prevent over-expanding too much
+        expand_x = max(float(pad_x), bw * 0.6)
+        expand_y = max(float(pad_y), bh * 0.6)
+
+        expand_x = min(expand_x, bw * float(max_expand_ratio))
+        expand_y = min(expand_y, bh * float(max_expand_ratio))
+
+        x1 -= expand_x
+        x2 += expand_x
+        y1 -= expand_y
+        y2 += expand_y
+
+        cx = (x1 + x2) / 2.0
+        cy = (y1 + y2) / 2.0
+        cw = x2 - x1
+        ch = y2 - y1
+
+        if square:
+            side = max(cw, ch, float(min_w), float(min_h))
+            cw = side
+            ch = side
+        else:
+            cw = max(cw, float(min_w))
+            ch = max(ch, float(min_h))
+
+        x1 = int(round(cx - cw / 2.0))
+        x2 = int(round(cx + cw / 2.0))
+        y1 = int(round(cy - ch / 2.0))
+        y2 = int(round(cy + ch / 2.0))
+
+        # clamp and shift back into frame
+        if x1 < 0:
+            x2 -= x1
+            x1 = 0
+        if y1 < 0:
+            y2 -= y1
+            y1 = 0
+        if x2 > w:
+            shift = x2 - w
+            x1 -= shift
+            x2 = w
+        if y2 > h:
+            shift = y2 - h
+            y1 -= shift
+            y2 = h
+
+        x1 = max(0, x1)
+        y1 = max(0, y1)
+        x2 = min(w, x2)
+        y2 = min(h, y2)
 
         if x2 <= x1 or y2 <= y1:
             return None
+
         crop = frame_bgr[y1:y2, x1:x2].copy()
         return crop if crop.size > 0 else None
+    
+    def _snapshot_crop_config(self, class_name: str, bbox=None):
+        cls = str(class_name or "").strip().lower()
 
+        bw = bh = 0.0
+        if bbox is not None and len(bbox) == 4:
+            x1, y1, x2, y2 = map(float, bbox)
+            bw = max(1.0, x2 - x1)
+            bh = max(1.0, y2 - y1)
+
+        # very small flat objects
+        if cls in ("mobile_phone", "phone", "cell_phone", "cellphone"):
+            return {
+                "pad_x": 30,
+                "pad_y": 30,
+                "min_w": 180,
+                "min_h": 180,
+                "square": True,
+                "max_expand_ratio": 3.0,
+            }
+
+        # tall narrow objects
+        if cls in ("water_bottle", "bottle"):
+            return {
+                "pad_x": 18,
+                "pad_y": 24,
+                "min_w": 110,
+                "min_h": 180,
+                "square": False,
+                "max_expand_ratio": 1.8,
+            }
+
+        # medium items
+        if cls in ("backpack", "bag", "handbag", "laptop"):
+            return {
+                "pad_x": 24,
+                "pad_y": 24,
+                "min_w": 160,
+                "min_h": 140,
+                "square": False,
+                "max_expand_ratio": 2.2,
+            }
+
+        # generic fallback based on bbox size
+        if bw <= 60 or bh <= 60:
+            return {
+                "pad_x": 24,
+                "pad_y": 24,
+                "min_w": 160,
+                "min_h": 160,
+                "square": True,
+                "max_expand_ratio": 2.5,
+            }
+
+        return {
+            "pad_x": 20,
+            "pad_y": 20,
+            "min_w": 130,
+            "min_h": 130,
+            "square": False,
+            "max_expand_ratio": 2.0,
+        }
+
+    def _snapshot_signature_group(self, item) -> tuple:
+        return (
+            str(item.class_name or "").strip().lower(),
+            str(item.view_name or "").strip().lower(),
+            str(item.roi_id or "").strip().lower(),
+        )
+
+    def _load_gray_for_hash(self, path: str):
+        try:
+            if not path or not os.path.exists(path):
+                return None
+            img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+            if img is None or img.size == 0:
+                return None
+            img = cv2.resize(img, (32, 32), interpolation=cv2.INTER_AREA)
+            return img
+        except Exception:
+            return None
+
+    def _ahash_bits(self, gray32):
+        if gray32 is None:
+            return None
+        try:
+            small = cv2.resize(gray32, (8, 8), interpolation=cv2.INTER_AREA)
+            mean = float(small.mean())
+            bits = (small >= mean).astype(np.uint8).flatten()
+            return bits
+        except Exception:
+            return None
+
+    def _hash_similarity(self, path_a: str, path_b: str) -> float:
+        ga = self._load_gray_for_hash(path_a)
+        gb = self._load_gray_for_hash(path_b)
+        if ga is None or gb is None:
+            return 0.0
+
+        ba = self._ahash_bits(ga)
+        bb = self._ahash_bits(gb)
+        if ba is None or bb is None or len(ba) != len(bb):
+            return 0.0
+
+        same = float((ba == bb).sum())
+        total = float(len(ba))
+        return same / total if total > 0 else 0.0
+
+    def _snapshot_quality_score(self, path: str) -> float:
+        try:
+            if not path or not os.path.exists(path):
+                return -1e9
+
+            img = cv2.imread(path)
+            if img is None or img.size == 0:
+                return -1e9
+
+            h, w = img.shape[:2]
+            area_score = float(w * h)
+
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            sharpness = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+            brightness = float(gray.mean())
+
+            # prefer normal brightness, not too dark / too bright
+            brightness_penalty = abs(brightness - 140.0)
+
+            return area_score + (sharpness * 8.0) - (brightness_penalty * 25.0)
+        except Exception:
+            return -1e9
+        
+    def _dedupe_snapshots_periodic(self, now_ts: float, force: bool = False):
+        if not self.snapshot_dedupe_enabled:
+            return False
+
+        if not force and (now_ts - self._last_snapshot_dedupe_ts) < self.snapshot_dedupe_every:
+            return False
+
+        changed = False
+        self._last_snapshot_dedupe_ts = now_ts
+
+        with self._lock:
+            items = list(self.lost_items.values())
+
+            # group by same class/view/roi
+            groups = defaultdict(list)
+            for it in items:
+                if not it or not getattr(it, "image_path", None):
+                    continue
+                if not os.path.exists(it.image_path):
+                    continue
+                groups[self._snapshot_signature_group(it)].append(it)
+
+            for _, group_items in groups.items():
+                if len(group_items) < 2:
+                    continue
+
+                # sort by lost time
+                group_items.sort(key=lambda x: float(x.lost_time or 0.0))
+
+                keepers = []
+
+                for cur in group_items:
+                    cur_path = str(cur.image_path or "")
+                    if not cur_path:
+                        continue
+
+                    matched_keeper = None
+
+                    for kept in keepers:
+                        # only compare near timestamps
+                        if abs(float(cur.lost_time or 0.0) - float(kept.lost_time or 0.0)) > self.snapshot_time_window_sec:
+                            continue
+
+                        sim = self._hash_similarity(cur_path, str(kept.image_path or ""))
+                        if sim >= self.snapshot_similarity_threshold:
+                            matched_keeper = kept
+                            break
+
+                    if matched_keeper is None:
+                        keepers.append(cur)
+                        continue
+
+                    # choose better image
+                    cur_score = self._snapshot_quality_score(cur_path)
+                    keep_score = self._snapshot_quality_score(str(matched_keeper.image_path or ""))
+
+                    if cur_score > keep_score:
+                        old_keep_path = str(matched_keeper.image_path or "")
+                        matched_keeper.image_path = cur_path
+                        cur.image_path = cur_path
+
+                        # redirect old matched item path to better one
+                        if old_keep_path and old_keep_path != cur_path and os.path.exists(old_keep_path):
+                            try:
+                                os.remove(old_keep_path)
+                            except Exception:
+                                pass
+                    else:
+                        # redirect current lost item to keeper image
+                        cur.image_path = str(matched_keeper.image_path or "")
+                        if cur_path != cur.image_path and os.path.exists(cur_path):
+                            try:
+                                os.remove(cur_path)
+                            except Exception:
+                                pass
+
+                    changed = True
+
+        return changed
+    
     def set_lost_item_status(self, lost_id: str, new_status: str):
         with self._lock:
             if lost_id in self.lost_items:
@@ -4157,12 +4436,23 @@ class LostAndFoundManager:
 
                     img_path = None
                     if self.enable_snapshots and frame_bgr is not None:
-                        crop = self._crop_bbox(frame_bgr, st.last_bbox, pad=20)
+                        cfg = self._snapshot_crop_config(st.class_name, st.last_bbox)
+
+                        crop = self._crop_bbox(
+                            frame_bgr,
+                            st.last_bbox,
+                            pad_x=cfg["pad_x"],
+                            pad_y=cfg["pad_y"],
+                            min_w=cfg["min_w"],
+                            min_h=cfg["min_h"],
+                            square=cfg["square"],
+                            max_expand_ratio=cfg["max_expand_ratio"],
+                        )
 
                         # quality guard
                         if crop is not None:
                             h, w = crop.shape[:2]
-                            if w < 60 or h < 60:
+                            if w < 100 or h < 100:
                                 crop = None
 
                         if crop is not None:
@@ -4225,6 +4515,10 @@ class LostAndFoundManager:
 
         # autosave outside lock; force only if new lost created
         self._autosave_if_needed(now_ts, force=new_lost_created)
+
+        dedupe_changed = self._dedupe_snapshots_periodic(now_ts, force=new_lost_created)
+        if dedupe_changed:
+            self._autosave_if_needed(now_ts, force=True)
 
         if int(now_ts) % 1 == 0:
             if DEBUG_LOST_FOUND:

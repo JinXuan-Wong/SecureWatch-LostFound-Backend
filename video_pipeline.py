@@ -651,7 +651,7 @@ class RealtimeFreshRTSPReaderThread(threading.Thread):
         preprocessor,
         out_queue,
         stop_event,
-        target_fps: float = 4.5,
+        target_fps: float = 2.5,
         warmup_grabs: int = 2,
         flush_grabs_per_cycle: int = 0,
         reconnect_backoff_sec: float = 0.5,
@@ -809,8 +809,8 @@ class PipelineConfig:
     num_workers: int = 1
     max_skip: int = 2
 
-    desired_fps_fisheye: float = 2.0
-    desired_fps_normal: float = 2.0
+    desired_fps_fisheye: float = 0.5
+    desired_fps_normal: float = 1.0
     display_fps: float = 8.0
 
     show_ui: bool = True
