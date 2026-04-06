@@ -416,7 +416,7 @@ class TrackingThreadROIMatchLF(lf.TrackingThread):
                 dets,
                 zones,
                 img_shape=img_shape,
-                min_ratio=0.50,
+                min_ratio=0.40,
             )
         except Exception:
             dets = []
@@ -479,7 +479,7 @@ class TrackingThreadROIMatchLF(lf.TrackingThread):
                 items,
                 zones,
                 img_shape=img.shape,
-                min_ratio=0.30,
+                min_ratio=0.40,
             )
             items = lf.dedup_by_overlap_ratio(items, overlap_thr=0.50)
 
@@ -891,13 +891,13 @@ class VideoPipeline:
 
         try:
             self.lost_manager = lf.LostAndFoundManager(
-                lost_seconds=30.0,
+                lost_seconds=20.0,
                 disappear_seconds=20.0,
                 enable_snapshots=True,
                 snapshot_dir=self.cam_snap_dir,
                 enable_owner_association=True,
-                near_px=120.0,
-                unattended_seconds=15.0,
+                near_px=140.0,
+                unattended_seconds=10.0,
                 logger=self.event_logger,
                 autosave_json_path=os.path.join(self.cam_out_dir, "lost_items.json"),
                 autosave_csv_path=os.path.join(self.cam_out_dir, "lost_items.csv"),
@@ -1851,7 +1851,7 @@ class VideoPipeline:
             self.out_queue,
             self.det_stop_event,
             self.detector,
-            confirm_k=5,
+            confirm_k=3,
         )
 
         if self.lost_manager:

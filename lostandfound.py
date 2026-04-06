@@ -2458,7 +2458,7 @@ class DetectionWorkerThread(threading.Thread):
                                 continue
 
                             H, W = img.shape[:2]
-                            PAD = 100
+                            PAD = 120
 
                             bbox = _poly_union_bbox_trimmed(zones_for_crop, trim_ratio=0.15)
                             roi_sq = None
@@ -2555,7 +2555,7 @@ class SupervisorThread(threading.Thread):
                 self.empty_count = 0
 
 class TrackingThread(threading.Thread):
-    def __init__(self, det_out_queue, out_queue, stop_event, detector, confirm_k=5):
+    def __init__(self, det_out_queue, out_queue, stop_event, detector, confirm_k=3):
         super().__init__(daemon=True)
         self.in_q = det_out_queue
         self.out_q = out_queue
@@ -2565,11 +2565,11 @@ class TrackingThread(threading.Thread):
 
         self.tracker_mgr = DeepSortTrackerManager(
             track_items_only=False,
-            max_age=80,
-            n_init=3,
+            max_age=100,
+            n_init=2,
             max_iou_distance=0.8,
             min_det_conf=0.25,
-            min_box_area=24 * 24,
+            min_box_area=22 * 22,
         )
 
         self._seen_count = {}
@@ -3262,7 +3262,7 @@ class YoloDetector:
 
         # ✅ 3) DEDUP overlaps
         persons = dedup_by_overlap_ratio(persons, overlap_thr=0.70)
-        items = dedup_by_overlap_ratio(items, overlap_thr=0.55)
+        items = dedup_by_overlap_ratio(items, overlap_thr=0.45)
 
         # 4) AREA RATIO FILTER (items only)
         h, w = img.shape[:2]
@@ -3803,13 +3803,13 @@ def setup_run(prefix: str) -> dict:
     event_logger = JsonlEventLogger(paths["event_log"])
 
     lost_manager = LostAndFoundManager(
-        lost_seconds=30.0,
+        lost_seconds=20.0,
         disappear_seconds=20.0,
         enable_snapshots=True,
         snapshot_dir=paths["snapshots"],
         enable_owner_association=True,
-        near_px=120.0,
-        unattended_seconds=15.0,
+        near_px=140.0,
+        unattended_seconds=10.0,
         logger=event_logger,
         autosave_json_path=paths["lost_json"],
         autosave_csv_path=paths["lost_csv"],
@@ -3833,13 +3833,13 @@ class LostAndFoundManager:
     """
     def __init__(
         self,
-        lost_seconds: float = 30.0,
+        lost_seconds: float = 20.0,
         disappear_seconds: float = 20.0,
         enable_snapshots: bool = True,
         snapshot_dir: str = None,
         enable_owner_association: bool = True,
-        near_px: float = 120.0,
-        unattended_seconds: float = 15.0,
+        near_px: float = 140.0,
+        unattended_seconds: float = 10.0,
         logger: Optional["JsonlEventLogger"] = None,
         autosave_json_path=None,
         autosave_csv_path=None,
@@ -4715,7 +4715,7 @@ if __name__ == "__main__":
         max_skip=1
     )
 
-    tracking_thread = TrackingThread(det_out_queue, out_queue, stop_event, detector, confirm_k=5)
+    tracking_thread = TrackingThread(det_out_queue, out_queue, stop_event, detector, confirm_k=3)
     tracking_thread.lost_manager = lost_manager
 
     # progress wiring

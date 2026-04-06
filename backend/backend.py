@@ -20,9 +20,10 @@ from typing import Any, Dict, List, Optional, Set, Tuple, Union
 from collections import defaultdict
 from urllib.parse import urlsplit, urlunsplit, quote, unquote
 import signal
-# Third-party imports
 import cv2
 from collections import deque
+from queue import Queue, Empty
+from threading import Lock
 
 LIVE_VIEW_SESSIONS: Dict[str, Any] = {}
 LIVE_VIEW_LOCK = threading.Lock()
@@ -168,6 +169,18 @@ def _ensure_roi_file(mode: str, id_: str) -> Path:
         )
     return roi_path
 
+def _mirror_live_event_log(cam_id: str, pipeline, stop_flag: threading.Event):
+    target = LIVE_ROOT / cam_id
+    target.mkdir(parents=True, exist_ok=True)
+    while not stop_flag.is_set():
+        try:
+            src = Path(pipeline.event_log_path)
+            dst = target / "event_log.jsonl"
+            if src.exists():
+                dst.write_bytes(src.read_bytes())
+        except Exception:
+            pass
+        time.sleep(0.5)
 
 def _reset_live_run_files(cam_id: str) -> None:
     """
@@ -1778,40 +1791,51 @@ _live_video_restart_lock = threading.Lock()
 _live_video_restart_pending: Set[
     str] = set()  # Videos pending restart                                          def check_and_restart_ended_videos():
 
-
 def check_and_restart_ended_videos():
     """
-    Check all live pipelines for ended videos and restart them using existing restart_live()
+    Restart only FILE/upload videos that truly ended.
+
+    IMPORTANT:
+    - RTSP cameras must NOT use file-style "ended" detection.
+    - RTSP can briefly stall / queue-empty / reconnect without actually ending.
+    - Restarting RTSP here breaks tracking continuity and makes event_log look stuck.
     """
     with _live_video_monitor_lock:
         current_time = time.time()
         videos_to_restart = []
 
-        # Check each live pipeline
         for cam_id, pipeline in list(pipelines_live.items()):
             try:
-                # Check if video ended using pipeline attributes
+                src = get_live_source(cam_id)
+                is_rtsp = str(src).startswith("rtsp://") or str(src).startswith("rtsps://")
+
+                # Skip RTSP here
+                if is_rtsp:
+                    continue
+
                 video_ended = False
 
-                # Method 1: Check if pipeline has eof_reached attribute
-                if hasattr(pipeline, 'eof_reached'):
-                    video_ended = pipeline.eof_reached
-
-                # Method 2: Check if pipeline has is_running method and it returns False
-                elif hasattr(pipeline, 'is_running'):
-                    video_ended = not pipeline.is_running()
-
-                # Method 3: Check if frame queue is empty (if accessible)
-                elif hasattr(pipeline, 'frame_queue'):
+                if hasattr(pipeline, "eof_reached"):
                     try:
-                        video_ended = pipeline.frame_queue.empty() and getattr(pipeline, '_eof', False)
-                    except:
-                        pass
+                        video_ended = bool(pipeline.eof_reached)
+                    except Exception:
+                        video_ended = False
+
+                elif hasattr(pipeline, "is_running"):
+                    try:
+                        video_ended = not bool(pipeline.is_running())
+                    except Exception:
+                        video_ended = False
+
+                elif hasattr(pipeline, "frame_queue"):
+                    try:
+                        video_ended = pipeline.frame_queue.empty() and bool(getattr(pipeline, "_eof", False))
+                    except Exception:
+                        video_ended = False
 
                 if video_ended:
-                    # Don't restart too frequently (cooldown period)
                     last_ended = _live_video_ended.get(cam_id, 0)
-                    if current_time - last_ended > 10:  # 10 second cooldown
+                    if current_time - last_ended > 10:
                         _live_video_ended[cam_id] = current_time
                         videos_to_restart.append(cam_id)
                         _system(f"LIVE: Video ended for {cam_id}, queued for restart")
@@ -1819,10 +1843,8 @@ def check_and_restart_ended_videos():
             except Exception as e:
                 _system(f"Error checking video end for {cam_id}: {e}")
 
-        # Restart videos outside the pipeline iteration loop
         for cam_id in videos_to_restart:
             restart_single_live_camera(cam_id)
-
 
 def restart_single_live_camera(cam_id: str) -> bool:
     """
@@ -1859,9 +1881,11 @@ def restart_single_live_camera(cam_id: str) -> bool:
             try:
                 if hasattr(old_p, "stop"):
                     old_p.stop()
+                if hasattr(old_p, "join"):
+                    old_p.join(timeout=3.0)
                 _system(f"LIVE: Stopped pipeline for {cam_id}")
             except Exception as e:
-                _system(f"LIVE: Error stopping pipeline for {cam_id}: {e}")
+                system(f"LIVE: Error stopping pipeline for {cam_id}: {e}")
 
         try:
             pipelines_live.pop(cam_id, None)
@@ -1888,7 +1912,10 @@ def restart_single_live_camera(cam_id: str) -> bool:
         # 4) prepare common paths
         # ---------------------------------
         roi_path = _ensure_roi_file("live", cam_id)
-        _reset_live_run_files(cam_id)
+
+        # only reset for FILE source, not RTSP restart
+        if not is_rtsp:
+            _reset_live_run_files(cam_id)
 
         forced_video_type = None
         source_kind = "RTSP" if is_rtsp else "FILE"
@@ -2149,6 +2176,8 @@ def start_live_pipelines(limit_normal: int = 999, limit_fisheye: int = 999):
             try:
                 if hasattr(p, "stop"):
                     p.stop()
+                if hasattr(p, "join"):
+                    p.join(timeout=3.0)
             except Exception:
                 pass
         pipelines_live = {}
@@ -2201,7 +2230,6 @@ def start_live_pipelines(limit_normal: int = 999, limit_fisheye: int = 999):
                 continue
 
             roi_path = _ensure_roi_file("live", cam_id)
-            _reset_live_run_files(cam_id)
 
             cfg = PipelineConfig(
                 camera_id=cam_id,
@@ -3320,6 +3348,63 @@ def dismiss_lostfound_alert(alert_id: str):
 
     _write_items_store(store)
     return {"ok": True, "id": alert_id}
+
+_lf_notif_subscribers: List[Queue] = []
+_lf_notif_lock = Lock()
+_lf_emitted_ids: Set[str] = set()
+
+def _lf_broadcast_notification(payload: Dict[str, Any]) -> None:
+    with _lf_notif_lock:
+        dead = []
+        for q in _lf_notif_subscribers:
+            try:
+                q.put_nowait(payload)
+            except Exception:
+                dead.append(q)
+        for q in dead:
+            try:
+                _lf_notif_subscribers.remove(q)
+            except Exception:
+                pass
+
+
+def _lf_register_subscriber() -> Queue:
+    q = Queue()
+    with _lf_notif_lock:
+        _lf_notif_subscribers.append(q)
+    return q
+
+
+def _lf_unregister_subscriber(q: Queue) -> None:
+    with _lf_notif_lock:
+        try:
+            _lf_notif_subscribers.remove(q)
+        except ValueError:
+            pass
+
+@app.get("/api/lostfound/notifications/stream")
+def lostfound_notifications_stream():
+    def event_gen():
+        q = _lf_register_subscriber()
+        try:
+            while True:
+                try:
+                    payload = q.get(timeout=15.0)
+                    yield f"data: {json.dumps(payload)}\n\n"
+                except Empty:
+                    yield ": keepalive\n\n"
+        finally:
+            _lf_unregister_subscriber(q)
+
+    return StreamingResponse(
+        event_gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 # ---------- settings ----------
 @app.get("/api/lostfound/settings")
@@ -4923,6 +5008,49 @@ def _apply_override(item: Dict[str, Any], overrides: Dict[str, Dict[str, Any]]) 
 
     return item
 
+def _maybe_emit_lf_notification(item: Dict[str, Any], request_base: str) -> None:
+    if not isinstance(item, dict):
+        return
+
+    item_id = str(item.get("id") or "").strip()
+    if not item_id:
+        return
+
+    status = str(item.get("status") or "lost").lower().strip()
+    if status != "lost":
+        return
+
+    with _lf_notif_lock:
+        if item_id in _lf_emitted_ids:
+            return
+        _lf_emitted_ids.add(item_id)
+
+    ts = item.get("lastSeenTs") or item.get("firstSeenTs") or time.time()
+    try:
+        ts = float(ts)
+    except Exception:
+        ts = time.time()
+
+    label = str(item.get("label") or "item")
+    location = str(item.get("location") or item.get("cameraId") or item.get("videoId") or "Unknown")
+    image_url = item.get("imageUrl")
+
+    severity = "medium"
+    if label.lower().replace(" ", "_") in ("wallet", "mobile_phone", "laptop", "tablet"):
+        severity = "high"
+
+    payload = {
+        "id": item_id,
+        "cameraId": str(item.get("cameraId") or item.get("videoId") or ""),
+        "cameraName": location,
+        "type": "lost-found",
+        "timestamp": ts,
+        "severity": severity,
+        "message": f"Lost item detected: {label} ({location})",
+        "imageUrl": image_url,
+    }
+    _lf_broadcast_notification(payload)
+    
 @app.get("/api/lostfound/items")
 def api_lostfound_items(request: Request):
     base = str(request.base_url).rstrip("/")
@@ -4969,12 +5097,11 @@ def api_lostfound_items(request: Request):
         ):
             if k in item and item[k] is not None:
                 merged[k] = item[k]
-                
 
         store[iid] = merged
 
-   # -------------------------
-    # 1) LIVE items (pipelines)
+    # -------------------------
+    # 1) LIVE items from running pipelines
     # -------------------------
     try:
         for cam_id, p in list(pipelines.items()):
@@ -4993,7 +5120,7 @@ def api_lostfound_items(request: Request):
                 norm = _normalize_live_item(cam_id, it, base)
                 norm["id"] = str(norm.get("id") or "")
 
-                # ✅ IMPORTANT: save snapshot fields for LIVE too
+                # save snapshot fields for LIVE too
                 snap = it.get("snapshot_path") or it.get("snapshot") or it.get("image_path")
                 if snap:
                     snap = str(snap)
@@ -5008,12 +5135,67 @@ def api_lostfound_items(request: Request):
                     norm["imageUrl"] = None
 
                 norm = _apply_override(norm, overrides)
-
-                # ✅ store history even if file later gets overwritten
                 _store_merge(norm)
+                _maybe_emit_lf_notification(norm, base)
 
     except Exception:
         pass
+
+    # -------------------------
+    # 1B) LIVE saved items from disk
+    # IMPORTANT:
+    # read history from outputs/lost_and_found/live/<cam_id>/lost_items.json
+    # so RTSP/live cameras still show lost-item details even if pipeline
+    # memory changes or reconnect happens
+    # -------------------------
+    try:
+        if LIVE_ROOT.exists():
+            for cam_dir in LIVE_ROOT.iterdir():
+                if not cam_dir.is_dir():
+                    continue
+
+                cam_id = cam_dir.name
+                p_json = cam_dir / "lost_items.json"
+                if not p_json.exists():
+                    continue
+
+                data = _read_json_file(p_json)
+
+                items = None
+                if isinstance(data, dict):
+                    items = data.get("items")
+                if items is None and isinstance(data, list):
+                    items = data
+                if not isinstance(items, list):
+                    items = []
+
+                for it in items:
+                    if not isinstance(it, dict):
+                        continue
+
+                    norm = _normalize_live_item(cam_id, it, base)
+                    norm["id"] = str(norm.get("id") or "")
+
+                    snap = it.get("snapshot_path") or it.get("snapshot") or it.get("image_path")
+                    if snap:
+                        snap = str(snap)
+                        norm["snapshot"] = snap
+                        norm["snapshot_path"] = snap
+                        norm["image_path"] = snap
+                        try:
+                            norm["imageUrl"] = to_image_url(snap, base)
+                        except Exception:
+                            norm["imageUrl"] = None
+                    else:
+                        norm["imageUrl"] = None
+
+                    norm = _apply_override(norm, overrides)
+                    _store_merge(norm)
+
+    except Exception:
+        pass
+
+    # -------------------------
     # 2) OFFLINE analyzed items
     # -------------------------
     try:
@@ -5060,8 +5242,6 @@ def api_lostfound_items(request: Request):
                     norm["imageUrl"] = None
 
                 norm = _apply_override(norm, overrides)
-
-                # store history
                 _store_merge(norm)
 
     except Exception:
