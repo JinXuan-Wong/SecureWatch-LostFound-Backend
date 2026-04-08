@@ -416,7 +416,7 @@ class TrackingThreadROIMatchLF(lf.TrackingThread):
                 dets,
                 zones,
                 img_shape=img_shape,
-                min_ratio=0.40,
+                min_ratio=0.30,
             )
         except Exception:
             dets = []
@@ -456,7 +456,7 @@ class TrackingThreadROIMatchLF(lf.TrackingThread):
                 items.append(d)
 
         person_conf = max(0.30, float(getattr(self.detector, "person_conf", 0.30)))
-        item_conf = max(0.20, float(getattr(self.detector, "item_capture_conf", 0.08)))
+        item_conf = max(0.08, float(getattr(self.detector, "item_capture_conf", 0.08)))
         min_area_person = int(getattr(self.detector, "min_area_person", 40 * 40))
         min_area_item = int(getattr(self.detector, "min_area_item", 20 * 20))
 
@@ -479,7 +479,7 @@ class TrackingThreadROIMatchLF(lf.TrackingThread):
                 items,
                 zones,
                 img_shape=img.shape,
-                min_ratio=0.40,
+                min_ratio=0.30,
             )
             items = lf.dedup_by_overlap_ratio(items, overlap_thr=0.50)
 
@@ -807,7 +807,7 @@ class PipelineConfig:
     roi_config_path: str
     fisheye_config_path: str = FISHEYE_CFG_STORE
     num_workers: int = 1
-    max_skip: int = 2
+    max_skip: float = 2
 
     desired_fps_fisheye: float = 0.5
     desired_fps_normal: float = 1.0
@@ -817,6 +817,8 @@ class PipelineConfig:
     enable_detection: bool = True
     force_video_type: Optional[str] = None
     source_kind: str = "FILE"
+
+    detector_group: str = "A"
 
     base_frame_skip_fisheye_rtsp: int = 0
     base_frame_skip_normal_rtsp: int = 0
@@ -1976,7 +1978,12 @@ class VideoPipeline:
     def start(self):
         try:
             lf._step("PHASE 2", f"Starting pipeline for {self.cfg.camera_id}")
-
+            try:
+                lf._system(
+                    f"DETECTOR GROUP MAP cam={self.cfg.camera_id} -> group={self.cfg.detector_group}"
+                )
+            except Exception:
+                print(f"[SYSTEM] DETECTOR GROUP MAP cam={self.cfg.camera_id} -> group={self.cfg.detector_group}")
             # ---------------------------------------------------------
             # reset runtime state
             # ---------------------------------------------------------
@@ -2188,6 +2195,7 @@ class VideoPipeline:
                 roi_ready=self._roi_available_for_detection,
                 enable_detection=bool(detection_can_run),
                 frame_skip=self._get_base_frame_skip(),
+                detector_group=self.cfg.detector_group,
             )
 
             return True

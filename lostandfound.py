@@ -1,3 +1,4 @@
+# lostandfound.py
 import json
 import gc
 import logging
@@ -32,7 +33,7 @@ LOSTFOUND_BACKEND_DIR = CURRENT_FILE.parents[1]
 #  SET YOUR VIDEO PATH HERE
 # ---------------------------------------------------------
 # VIDEO_PATH = r"D:\20251110081000-20251110084059\B100D_B_Block_B_Block_20251110081000_20251110084058_39454624.mp4"
-VIDEO_PATH = r"D:\DrTew\SecureWatch by QingYing JinXuan\Videos\B001G_B_Block_B_Block_20251110080959_20251110083105_39454534.mp4"
+VIDEO_PATH = r"D:\DrTew\SecureWatch by QingYing JinXuan\Videos\B100D_B_Block_B_Block_20251110081000_20251110084058_39454624.mp4"
 # VIDEO_PATH = r"D:\20251110081000-20251110084059\B001G_B_Block_B_Block_20251110083105_20251110084059_39975898.mp4"
 # ---------------------------------------------------------
 
@@ -2565,11 +2566,15 @@ class TrackingThread(threading.Thread):
 
         self.tracker_mgr = DeepSortTrackerManager(
             track_items_only=False,
-            max_age=100,
-            n_init=2,
-            max_iou_distance=0.8,
-            min_det_conf=0.25,
-            min_box_area=22 * 22,
+            max_age=70,
+            n_init=1,
+            max_iou_distance=0.75,
+            embedder="mobilenet",
+            half=True,
+            bgr=True,
+            min_det_conf=0.10,
+            min_box_area=20 * 20,
+            max_trackers=16,
         )
 
         self._seen_count = {}
@@ -2996,11 +3001,26 @@ class YoloDetector:
         # models
         logger.info(f"[YoloDetector] Loading CUSTOM items model: {items_weights}")
         self.item_model = YOLO(items_weights)
-        self.item_names = self.item_model.names
-        logger.info(f"[CUSTOM MODEL CLASSES] {self.item_names}")
 
         logger.info(f"[YoloDetector] Loading COCO model: {coco_weights}")
         self.coco_model = YOLO(coco_weights)
+
+        # Force models onto selected device
+        try:
+            if self.device is not None and getattr(self.device, "type", "") == "cuda":
+                self.item_model.to("cuda")
+                self.coco_model.to("cuda")
+                logger.info("[YoloDetector] Both YOLO models moved to CUDA")
+            else:
+                self.item_model.to("cpu")
+                self.coco_model.to("cpu")
+                logger.info("[YoloDetector] Both YOLO models using CPU")
+        except Exception as e:
+            logger.warning(f"[YoloDetector] Failed to move models to device: {e}")
+
+        self.item_names = self.item_model.names
+        logger.info(f"[CUSTOM MODEL CLASSES] {self.item_names}")
+
         self.coco_names = self.coco_model.names
 
     # ---------------------------------------------------------
@@ -3251,7 +3271,7 @@ class YoloDetector:
         )
 
         items = filter_detections_to_zones_by_overlap(
-            items, zones, img_shape=img.shape, min_ratio=0.40
+            items, zones, img_shape=img.shape, min_ratio=0.30
         )
 
         # 2) ROI GATING (items only)
@@ -3428,14 +3448,13 @@ def attach_track_ids_to_detections(detections, tracks, iou_thr=0.3):
 
     return detections
 
-
 class DeepSortTrackerManager:
     def __init__(
         self,
-        track_items_only: bool = True,
-        max_age: int = 50,
-        n_init: int =1,
-        max_iou_distance: float = 0.7,
+        track_items_only: bool = False,
+        max_age: int = 80,
+        n_init: int = 1,
+        max_iou_distance: float = 0.8,
         embedder: str = "mobilenet",
         half: bool = True,
         bgr: bool = True,
@@ -3468,14 +3487,25 @@ class DeepSortTrackerManager:
                 self._locks[view_name] = threading.Lock()
 
             if view_name not in self._trackers:
-                self._trackers[view_name] = DeepSort(
-                    max_age=self.max_age,
-                    n_init=self.n_init,
-                    max_iou_distance=self.max_iou_distance,
-                    embedder=self.embedder,
-                    half=self.half,
-                    bgr=self.bgr,
-                )
+                try:
+                    self._trackers[view_name] = DeepSort(
+                        max_age=self.max_age,
+                        n_init=self.n_init,
+                        max_iou_distance=self.max_iou_distance,
+                        embedder=self.embedder,
+                        half=self.half,
+                        bgr=self.bgr,
+                        embedder_gpu=torch.cuda.is_available(),
+                    )
+                except TypeError:
+                    self._trackers[view_name] = DeepSort(
+                        max_age=self.max_age,
+                        n_init=self.n_init,
+                        max_iou_distance=self.max_iou_distance,
+                        embedder=self.embedder,
+                        half=self.half,
+                        bgr=self.bgr,
+                    )
             self._tracker_last[view_name] = time.time()
 
             # LRU eviction (optional)
@@ -3611,6 +3641,13 @@ class TrackedObjectState:
     last_attended_time: Optional[float] = None
     last_attended_by_person_id: Optional[int] = None
     last_bbox: Optional[List[float]] = None
+
+    # NEW: ownership lock
+    locked_owner_person_id: Optional[int] = None
+    owner_candidate_person_id: Optional[int] = None
+    owner_candidate_since: Optional[float] = None
+    owner_absent_logged: bool = False
+    owner_last_seen_time: Optional[float] = None
 
 
 @dataclass
@@ -3806,16 +3843,23 @@ def setup_run(prefix: str) -> dict:
     event_logger = JsonlEventLogger(paths["event_log"])
 
     lost_manager = LostAndFoundManager(
-        lost_seconds=20.0,
-        disappear_seconds=20.0,
+        lost_seconds=6.0,
+        disappear_seconds=5.0,
         enable_snapshots=True,
         snapshot_dir=paths["snapshots"],
         enable_owner_association=True,
-        near_px=140.0,
-        unattended_seconds=10.0,
+
+        near_px=140.0,              # tighter than before
+        unattended_seconds=5.0,
+
+        owner_lock_px=120.0,        # stricter for owner locking
+        owner_lock_seconds=1.0,   
+
         logger=event_logger,
         autosave_json_path=paths["lost_json"],
         autosave_csv_path=paths["lost_csv"],
+        owner_grace_seconds = 4.0,
+        item_grace_seconds = 5.0,
     )
 
     return {
@@ -3847,6 +3891,12 @@ class LostAndFoundManager:
         autosave_json_path=None,
         autosave_csv_path=None,
         autosave_every=3.0,
+
+        # NEW
+        owner_lock_px: float = 90.0,
+        owner_lock_seconds: float = 2.0,
+        owner_grace_seconds: float = 3.0,
+        item_grace_seconds: float = 4.0,
     ):
         self.lost_seconds = float(lost_seconds)
         self.disappear_seconds = float(disappear_seconds)
@@ -3884,6 +3934,10 @@ class LostAndFoundManager:
         self.snapshot_similarity_threshold = 0.92
         self.snapshot_time_window_sec = 600.0  # 10 minutes
         self._last_snapshot_dedupe_ts = 0.0
+        self.owner_lock_px = float(owner_lock_px)
+        self.owner_lock_seconds = float(owner_lock_seconds)
+        self.owner_grace_seconds = float(owner_grace_seconds)
+        self.item_grace_seconds = float(item_grace_seconds)
         
     @staticmethod
     def _center_xy(b):
@@ -4043,26 +4097,37 @@ class LostAndFoundManager:
             bw = max(1.0, x2 - x1)
             bh = max(1.0, y2 - y1)
 
-        # very small flat objects
+        # small flat objects -> keep more context
         if cls in ("mobile_phone", "phone", "cell_phone", "cellphone"):
             return {
-                "pad_x": 30,
-                "pad_y": 30,
-                "min_w": 180,
-                "min_h": 180,
+                "pad_x": 45,
+                "pad_y": 45,
+                "min_w": 220,
+                "min_h": 220,
                 "square": True,
-                "max_expand_ratio": 3.0,
+                "max_expand_ratio": 4.0,
             }
 
-        # tall narrow objects
+        # water bottle -> mimic Version 2 tighter look
         if cls in ("water_bottle", "bottle"):
             return {
-                "pad_x": 18,
-                "pad_y": 24,
-                "min_w": 110,
-                "min_h": 180,
+                "pad_x": 20,
+                "pad_y": 20,
+                "min_w": 0,
+                "min_h": 0,
                 "square": False,
-                "max_expand_ratio": 1.8,
+                "max_expand_ratio": 1.0,
+            }
+
+        # tablets -> moderate context
+        if cls in ("tablet",):
+            return {
+                "pad_x": 28,
+                "pad_y": 28,
+                "min_w": 170,
+                "min_h": 170,
+                "square": False,
+                "max_expand_ratio": 2.2,
             }
 
         # medium items
@@ -4076,17 +4141,18 @@ class LostAndFoundManager:
                 "max_expand_ratio": 2.2,
             }
 
-        # generic fallback based on bbox size
+        # generic small object fallback
         if bw <= 60 or bh <= 60:
             return {
-                "pad_x": 24,
-                "pad_y": 24,
-                "min_w": 160,
-                "min_h": 160,
+                "pad_x": 30,
+                "pad_y": 30,
+                "min_w": 180,
+                "min_h": 180,
                 "square": True,
-                "max_expand_ratio": 2.5,
+                "max_expand_ratio": 3.0,
             }
 
+        # default
         return {
             "pad_x": 20,
             "pad_y": 20,
@@ -4294,7 +4360,7 @@ class LostAndFoundManager:
     ):
         """
         tracked_objects: list of dicts with:
-          track_id, class_name, bbox, confirmed, confidence, det_bbox(optional)
+        track_id, class_name, bbox, confirmed, confidence, det_bbox(optional)
         If enable_owner_association=True, you MUST pass BOTH person tracks + item tracks.
         """
         new_lost_created = False
@@ -4342,6 +4408,15 @@ class LostAndFoundManager:
             persons = [t for t in tracked_objects if (_cls(t) == "person") and t.get("confirmed", True)]
             items = [t for t in tracked_objects if (_cls(t) not in (None, "person")) and t.get("confirmed", True)]
 
+            # DEBUG: verify person tracks are really reaching process_tracks()
+            if self.logger:
+                self.logger.log("process_tracks_debug_counts", {
+                    "view": view_name,
+                    "roi_id": roi_id,
+                    "persons_count": len(persons),
+                    "items_count": len(items),
+                })
+
             seen_keys = set()
 
             for t in items:
@@ -4364,9 +4439,10 @@ class LostAndFoundManager:
                         last_seen_time=now_ts,
                     )
 
-                    # ✅ IMPORTANT: DO NOT assume attended at start.
+                    # IMPORTANT: do not assume attended at start
                     st.last_attended_time = None
                     st.last_attended_by_person_id = None
+                    st.owner_absent_logged = False
 
                     self.states[key] = st
 
@@ -4392,10 +4468,11 @@ class LostAndFoundManager:
                     st.last_bbox = list(map(float, bb_use))
 
                 # -------------------------
-                # Owner association (required for LOST)
+                # Owner association with LOCK
                 # -------------------------
-                if self.enable_owner_association and persons and bb_item is not None:
+                if self.enable_owner_association and bb_item is not None:
                     item_c = self._center_xy(bb_item)
+
                     best_pid = None
                     best_dist = 1e9
 
@@ -4404,23 +4481,114 @@ class LostAndFoundManager:
                         bb_p = _bbox(p)
                         if pid < 0 or bb_p is None:
                             continue
+
                         pfoot = self._person_foot_xy(bb_p)
                         dpx = self._dist(item_c, pfoot)
+
                         if dpx < best_dist:
                             best_dist = dpx
                             best_pid = pid
 
-                    if best_pid is not None and best_dist <= self.near_px:
-                        st.last_attended_time = now_ts
-                        st.last_attended_by_person_id = best_pid
+                    # STEP A: no locked owner yet -> try to lock one
+                    if st.locked_owner_person_id is None:
+                        if best_pid is not None and best_dist <= self.owner_lock_px:
+                            if st.owner_candidate_person_id != best_pid:
+                                st.owner_candidate_person_id = best_pid
+                                st.owner_candidate_since = now_ts
+                            else:
+                                if (
+                                    st.owner_candidate_since is not None
+                                    and (now_ts - st.owner_candidate_since) >= self.owner_lock_seconds
+                                ):
+                                    st.locked_owner_person_id = best_pid
+                                    st.last_attended_by_person_id = best_pid
+                                    st.last_attended_time = now_ts
+                                    st.owner_absent_logged = False
+                                    st.owner_last_seen_time = now_ts
+
+                                    if self.logger:
+                                        self.logger.log("owner_locked", {
+                                            "view": view_name,
+                                            "roi_id": roi_id,
+                                            "track_id": tid,
+                                            "class_name": st.class_name,
+                                            "owner_person_id": best_pid,
+                                            "lock_distance_px": round(best_dist, 2),
+                                        })
+                        else:
+                            st.owner_candidate_person_id = None
+                            st.owner_candidate_since = None
+
+                    # STEP B: already have locked owner -> only locked owner can attend
+                    else:
+                        locked_pid = st.locked_owner_person_id
+                        locked_found = False
+                        locked_dist = None
+
+                        for p in persons:
+                            pid = int(p.get("track_id", -1))
+                            if pid != locked_pid:
+                                continue
+
+                            bb_p = _bbox(p)
+                            if bb_p is None:
+                                continue
+
+                            pfoot = self._person_foot_xy(bb_p)
+                            dpx = self._dist(item_c, pfoot)
+
+                            locked_found = True
+                            locked_dist = dpx
+                            break
+
+                        if locked_found and locked_dist is not None and locked_dist <= self.near_px:
+                            st.last_attended_time = now_ts
+                            st.last_attended_by_person_id = locked_pid
+                            st.owner_last_seen_time = now_ts
+                            st.owner_absent_logged = False
+                        else:
+                            if st.owner_last_seen_time is None and st.last_attended_time is not None:
+                                st.owner_last_seen_time = st.last_attended_time
+                # -------------------------
+                # DEBUG: owner absent tracking (log once only)
+                # -------------------------
+                if st.locked_owner_person_id is not None and st.last_attended_time is not None:
+                    base_attended_time = st.last_attended_time
+                    if (
+                        st.owner_last_seen_time is not None
+                        and (now_ts - st.owner_last_seen_time) <= self.owner_grace_seconds
+                    ):
+                        base_attended_time = now_ts
+
+                    unattended_for = now_ts - base_attended_time if base_attended_time is not None else 1e9
+
+                    if unattended_for >= self.unattended_seconds and not st.is_marked_lost:
+                        if self.logger and not getattr(st, "owner_absent_logged", False):
+                            self.logger.log("owner_absent_threshold_reached", {
+                                "view": view_name,
+                                "roi_id": roi_id,
+                                "track_id": tid,
+                                "class_name": st.class_name,
+                                "owner_person_id": st.locked_owner_person_id,
+                                "unattended_for": round(unattended_for, 2),
+                            })
+                            st.owner_absent_logged = True
 
                 # -------------------------
-                # ✅ LOST decision (OWNER REQUIRED)
+                # LOST decision (OWNER REQUIRED)
                 # -------------------------
-                has_owner = (st.last_attended_by_person_id is not None)
+                has_owner = (st.locked_owner_person_id is not None)
                 unattended_ok = False
-                if has_owner and st.last_attended_time is not None:
-                    unattended_ok = (now_ts - st.last_attended_time) >= self.unattended_seconds
+
+                base_attended_time = st.last_attended_time
+                if (
+                    st.owner_last_seen_time is not None
+                    and (now_ts - st.owner_last_seen_time) <= self.owner_grace_seconds
+                ):
+                    base_attended_time = now_ts
+
+                if has_owner and base_attended_time is not None:
+                    unattended_ok = (now_ts - base_attended_time) >= self.unattended_seconds
 
                 if (
                     (not st.is_marked_lost)
@@ -4452,8 +4620,15 @@ class LostAndFoundManager:
                         # quality guard
                         if crop is not None:
                             h, w = crop.shape[:2]
-                            if w < 100 or h < 100:
-                                crop = None
+                            if st.class_name in ("water_bottle", "bottle"):
+                                if w < 70 or h < 120:
+                                    crop = None
+                            elif st.class_name in ("mobile_phone", "phone", "cell_phone", "cellphone"):
+                                if w < 120 or h < 120:
+                                    crop = None
+                            else:
+                                if w < 100 or h < 100:
+                                    crop = None
 
                         if crop is not None:
                             roi_index = self._roi_to_index(st.roi_id)
@@ -4464,8 +4639,8 @@ class LostAndFoundManager:
                             prefix = f"{self.venue_code}_{class_code}_{roi_code}_LOST_"
                             seq = self._next_seq(folder, prefix)
 
-                            ts = time.strftime("%Y%m%d_%H%M%S")
-                            filename = f"{prefix}{seq:03d}_{ts}_{lost_id}.jpg"
+                            ts_str = time.strftime("%Y%m%d_%H%M%S")
+                            filename = f"{prefix}{seq:03d}_{ts_str}_{lost_id}.jpg"
                             img_path = os.path.join(folder, filename)
 
                             try:
@@ -4483,7 +4658,7 @@ class LostAndFoundManager:
                         duration_before_lost=st.duration_visible,
                         status="pending",
                         image_path=img_path,
-                        owner_person_id=st.last_attended_by_person_id,  # ✅ guaranteed not None here
+                        owner_person_id=st.locked_owner_person_id,
                         last_attended_time=st.last_attended_time,
                     )
 
@@ -4500,7 +4675,7 @@ class LostAndFoundManager:
                     continue
                 if key in seen_keys:
                     continue
-                if (now_ts - st.last_seen_time) >= self.disappear_seconds:
+                if (now_ts - st.last_seen_time) >= (self.disappear_seconds + self.item_grace_seconds):
                     to_remove.append(key)
 
             for key in to_remove:
@@ -4523,7 +4698,7 @@ class LostAndFoundManager:
         if int(now_ts) % 1 == 0:
             if DEBUG_LOST_FOUND:
                 print(f"[P6] view={view_name} items_states={len(self.states)} lost_items={len(self.lost_items)}")
-
+    
     def _dedup_lost_items(self, items: list) -> list:
         # 1) dedup by lost_id first
         by_id = {}
@@ -4571,10 +4746,6 @@ class LostAndFoundManager:
             writer.writeheader()
             for r in rows:
                 writer.writerow({k: r.get(k, "") for k in fieldnames})
-
-
-CURRENT_FILE = Path(__file__).resolve()
-LOSTFOUND_BACKEND_DIR = CURRENT_FILE.parent   # .../SecureWatch/lostfound_backend
 
 
 # ---------------------------------------------------------

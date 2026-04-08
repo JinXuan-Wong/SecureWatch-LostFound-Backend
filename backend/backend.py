@@ -24,6 +24,8 @@ import cv2
 from collections import deque
 from queue import Queue, Empty
 from threading import Lock
+import hashlib
+
 
 LIVE_VIEW_SESSIONS: Dict[str, Any] = {}
 LIVE_VIEW_LOCK = threading.Lock()
@@ -139,7 +141,7 @@ pipelines_settings: Dict[str, Any] = {}
 pipelines: Dict[str, Any] = {}
 _live_pipe_lock = threading.Lock()
 # ✅ MUST exist before _get_live_detector() is ever called
-_live_detector = None
+_live_detectors: Dict[str, Any] = {}
 _live_detector_lock = threading.Lock()
 
 # ============================================================
@@ -1948,7 +1950,7 @@ def restart_single_live_camera(cam_id: str) -> bool:
                 src=src,
                 roi_config_path=str(roi_path),
                 num_workers=1,
-                max_skip=1.0,
+                max_skip=0.8,
 
                 desired_fps_fisheye=0.5,
                 desired_fps_normal=1.0,
@@ -2081,36 +2083,102 @@ def _live_id(cam_id: str) -> str:
     return _base_id(cid)  # only normalize upload ids
 
 
-def _get_live_detector():
-    global _live_detector
+def _build_live_detector():
+    try:
+        if hasattr(lf, "configure_logging"):
+            lf.configure_logging(debug=False, mute_info=True)
+    except Exception:
+        pass
+
+    try:
+        device = lf.DeviceManager.get_device()
+    except Exception:
+        device = None
+
+    return lf.YoloDetector(
+        items_weights=getattr(lf, "WEIGHTS_ITEMS", None),
+        coco_weights=getattr(lf, "WEIGHTS_PERSON", None),
+        device=device,
+        item_capture_conf=0.25,
+        coco_capture_conf=0.25,
+        person_conf=0.45,
+        track_win=10,
+        confirm_k=3,
+        hold_frames=15,
+    )
+
+
+def _get_live_detector(group_key: str):
+    global _live_detectors
+    g = str(group_key or "A").upper()
+
     with _live_detector_lock:
-        if _live_detector is not None:
-            return _live_detector
+        det = _live_detectors.get(g)
+        if det is not None:
+            return det
 
-        try:
-            if hasattr(lf, "configure_logging"):
-                lf.configure_logging(debug=False, mute_info=True)
-        except Exception:
-            pass
+        det = _build_live_detector()
+        _live_detectors[g] = det
+        return det
 
-        try:
-            device = lf.DeviceManager.get_device()
-        except Exception:
-            device = None
+# ============================================================
+# Detector Group Assignment (Hybrid: manual override + auto)
+# ============================================================
+#MPORTANT:
+#Keep heavy cameras split across A and B.
+MANUAL_DETECTOR_GROUPS: Dict[str, str] = {
+    # -----------------------------
+    # Upload videos (preserve your original sequence)
+    # -----------------------------
+    "B001G_B_Block_B_Block_20251110103703_20251110104059_41001909": "A",
+    "B100D_B_Block_B_Block_20251110101000_20251110104057_40572930": "B",
+    "B001G_B_Block_B_Block_20251110083105_20251110084059_39975898": "A",
+    "B100D_B_Block_B_Block_20251110081000_20251110084058_39454624": "B",
 
-        _live_detector = lf.YoloDetector(
-            items_weights=getattr(lf, "WEIGHTS_ITEMS", None),
-            coco_weights=getattr(lf, "WEIGHTS_PERSON", None),
-            device=device,
-            item_capture_conf=0.25,
-            coco_capture_conf=0.25,
-            person_conf=0.45,
-            track_win=10,
-            confirm_k=3,
-            hold_frames=15,
-        )
-        return _live_detector
+    # -----------------------------
+    # RTSP cameras (preserve your original sequence)
+    # Put known heavier fisheye streams on different groups
+    # -----------------------------
+    "rtsp_1773308594748_819df8013cb51": "A",  # fisheye
+    "rtsp_1773308648388_52d4c9fa4e4108": "B",
+    "rtsp_1773308690931_36df724b6f90b8": "B",
+    "rtsp_1773308703234_4910a4da0c6978": "A",
 
+    "rtsp_1773559227781_07f05b889a7958": "B",  # fisheye
+    "rtsp_1773559352792_4bfa714dc33fb8": "A",
+    "rtsp_1773559379913_24d01fbe8bd7b": "A",
+    "rtsp_1773559393966_d07025f0cb29f8": "B",  # fisheye
+}
+
+
+def _stable_auto_detector_group(cam_id: str) -> str:
+    """
+    Stable A/B assignment for cameras not listed in MANUAL_DETECTOR_GROUPS.
+    Unlike Python hash(), md5-based assignment is stable across restarts.
+    """
+    cid = str(cam_id or "").strip()
+    h = hashlib.md5(cid.encode("utf-8")).hexdigest()
+    return "A" if (int(h, 16) % 2 == 0) else "B"
+
+
+def _live_detector_group_for_cam(cam_id: str) -> str:
+    """
+    Hybrid strategy:
+    1) Manual override for known heavy/special cameras
+    2) Stable auto-balance for all others
+    """
+    cid = str(cam_id or "").strip()
+
+    if cid in MANUAL_DETECTOR_GROUPS:
+        group = str(MANUAL_DETECTOR_GROUPS[cid]).upper().strip()
+        if group not in ("A", "B"):
+            group = "A"
+        _system(f"GROUP RESOLVE cam_id={cid} resolved_group={group} mode=MANUAL")
+        return group
+
+    group = _stable_auto_detector_group(cid)
+    _system(f"GROUP RESOLVE cam_id={cid} resolved_group={group} mode=AUTO")
+    return group
 
 def start_live_pipelines(limit_normal: int = 999, limit_fisheye: int = 999):
     """
@@ -2182,7 +2250,7 @@ def start_live_pipelines(limit_normal: int = 999, limit_fisheye: int = 999):
                 pass
         pipelines_live = {}
 
-        detector = _get_live_detector()
+
 
         # -----------------------------
         # 4) Start upload pipelines
@@ -2214,6 +2282,9 @@ def start_live_pipelines(limit_normal: int = 999, limit_fisheye: int = 999):
                 base_frame_skip_normal_file=0,
             )
 
+            det_group = _live_detector_group_for_cam(cam_id)
+            cfg.detector_group = det_group
+            detector = _get_live_detector(det_group)
             p = VideoPipeline(cfg, detector)
             if not p.start():
                 raise RuntimeError(f"pipeline start failed cam_id={cam_id} mode=live")
@@ -2257,6 +2328,9 @@ def start_live_pipelines(limit_normal: int = 999, limit_fisheye: int = 999):
                 drop_old_detection_jobs=False,
                 latest_only_tracking=False,
             )
+            det_group = _live_detector_group_for_cam(cam_id)
+            cfg.detector_group = det_group
+            detector = _get_live_detector(det_group)
             p = VideoPipeline(cfg, detector)
             if not p.start():
                 _system(f"LIVE: pipeline start failed cam_id={cam_id} (RTSP)")
