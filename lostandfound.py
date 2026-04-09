@@ -3313,13 +3313,28 @@ def draw_detections_with_id(img, detections):
     H, W = out.shape[:2]
 
     FONT = cv2.FONT_HERSHEY_SIMPLEX
-    FONT_SCALE = 0.55
-    FONT_THICKNESS = 1
     LINE_TYPE = cv2.LINE_AA
 
-    PAD_X = 4
-    PAD_Y = 3
-    GAP_Y = 4
+    base = min(W, H)
+
+    if base <= 540:          # small RTSP frames
+        FONT_SCALE = 0.35
+        FONT_THICKNESS = 1
+        PAD_X = 2
+        PAD_Y = 1
+        GAP_Y = 1
+    elif base <= 720:
+        FONT_SCALE = 0.55
+        FONT_THICKNESS = 1
+        PAD_X = 4
+        PAD_Y = 3
+        GAP_Y = 4
+    else:                    # larger upload/file frames
+        FONT_SCALE = 0.60
+        FONT_THICKNESS = 1.5
+        PAD_X = 5
+        PAD_Y = 4
+        GAP_Y = 4
 
     TEXT_COLOR = (0, 0, 0)
 
@@ -4112,12 +4127,12 @@ class LostAndFoundManager:
         # water bottle -> mimic Version 2 tighter look
         if cls in ("water_bottle", "bottle"):
             return {
-                "pad_x": 20,
-                "pad_y": 20,
-                "min_w": 0,
-                "min_h": 0,
+                "pad_x": 35,
+                "pad_y": 35,
+                "min_w": 120,
+                "min_h": 160,
                 "square": False,
-                "max_expand_ratio": 1.0,
+                "max_expand_ratio": 2.5,
             }
 
         # tablets -> moderate context
@@ -4409,15 +4424,6 @@ class LostAndFoundManager:
             persons = [t for t in tracked_objects if (_cls(t) == "person") and t.get("confirmed", True)]
             items = [t for t in tracked_objects if (_cls(t) not in (None, "person")) and t.get("confirmed", True)]
 
-            # DEBUG: verify person tracks are really reaching process_tracks()
-            if self.logger:
-                self.logger.log("process_tracks_debug_counts", {
-                    "view": view_name,
-                    "roi_id": roi_id,
-                    "persons_count": len(persons),
-                    "items_count": len(items),
-                })
-
             seen_keys = set()
 
             for t in items:
@@ -4622,7 +4628,7 @@ class LostAndFoundManager:
                         if crop is not None:
                             h, w = crop.shape[:2]
                             if st.class_name in ("water_bottle", "bottle"):
-                                if w < 70 or h < 120:
+                               if w < 50 or h < 90:
                                     crop = None
                             elif st.class_name in ("mobile_phone", "phone", "cell_phone", "cellphone"):
                                 if w < 120 or h < 120:

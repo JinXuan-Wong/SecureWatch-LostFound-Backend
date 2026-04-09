@@ -3073,7 +3073,22 @@ class VideoPipeline:
         try:
             if self.lost_manager is None:
                 return []
-            return self._to_plain(self.lost_manager.get_active_lost_items() or []) or []
+
+            items = self._to_plain(self.lost_manager.get_active_lost_items() or []) or []
+
+            # ✅ filter: only keep items with valid image path
+            filtered = []
+            for it in items:
+                if not isinstance(it, dict):
+                    continue
+
+                img = it.get("snapshot_path") or it.get("snapshot") or it.get("image_path")
+
+                if img:   # only keep if exists (not None / not empty)
+                    filtered.append(it)
+
+            return filtered
+
         except Exception:
             return []
 
