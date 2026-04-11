@@ -5057,7 +5057,7 @@ def _apply_override(item: Dict[str, Any], overrides: Dict[str, Dict[str, Any]]) 
     if not isinstance(item, dict):
         return item
 
-    item_id = str(item.get("id") or "")
+    item_id = str(item.get("id") or "").strip()
     if not item_id:
         return item
 
@@ -5065,22 +5065,63 @@ def _apply_override(item: Dict[str, Any], overrides: Dict[str, Dict[str, Any]]) 
     if not isinstance(ov, dict):
         return item
 
+    out = dict(item)
+
     if isinstance(ov.get("status"), str) and ov["status"] in ("lost", "solved"):
-        item["status"] = ov["status"]
+        out["status"] = ov["status"]
 
     if isinstance(ov.get("notes"), str):
-        item["notes"] = ov["notes"]
+        out["notes"] = ov["notes"]
 
     if isinstance(ov.get("updated_at"), (int, float)):
-        item["updatedAt"] = int(ov["updated_at"])
+        out["updatedAt"] = int(ov["updated_at"])
 
     if isinstance(ov.get("deleted"), bool):
-        item["deleted"] = ov["deleted"]
+        out["deleted"] = ov["deleted"]
 
-    if not item.get("snapshot") and isinstance(ov.get("snapshot"), str):
-        item["snapshot"] = ov["snapshot"]
+    if not out.get("snapshot") and isinstance(ov.get("snapshot"), str):
+        out["snapshot"] = ov["snapshot"]
 
-    return item
+    return out
+
+def _should_skip_lf_event_item(item: Dict[str, Any]) -> bool:
+    """
+    Reject broken / ghost Lost & Found items so they are not stored
+    and not shown on the Events page.
+    """
+    if not isinstance(item, dict):
+        return True
+
+    # deleted items should never appear again
+    if item.get("deleted") is True:
+        return True
+
+    # safe timestamp parsing
+    def _to_num(v) -> float:
+        try:
+            return float(v)
+        except Exception:
+            return 0.0
+
+    first_seen = _to_num(item.get("firstSeenTs"))
+    last_seen = _to_num(item.get("lastSeenTs"))
+
+    snap = (
+        item.get("snapshot")
+        or item.get("snapshot_path")
+        or item.get("image_path")
+        or item.get("imageUrl")
+    )
+
+    has_image = bool(str(snap).strip()) if snap is not None else False
+
+    # MAIN RULE YOU ASKED FOR:
+    # no valid time + no image => skip completely
+    if first_seen <= 0 and last_seen <= 0 and not has_image:
+        return True
+
+    return False
+
 
 def _maybe_emit_lf_notification(item: Dict[str, Any], request_base: str) -> None:
     if not isinstance(item, dict):
@@ -5136,8 +5177,15 @@ def api_lostfound_items(request: Request):
     if not isinstance(store, dict):
         store = {}
 
+    def _is_deleted_item(item_id: str) -> bool:
+        ov = overrides.get(str(item_id or "").strip()) or {}
+        return bool(ov.get("deleted") is True)
+
     def _store_merge(item: Dict[str, Any]) -> None:
-        """inline merge (no new helper functions outside)"""
+        """
+        Merge item into persistent store.
+        Deleted items are NOT re-merged, but old history already in store is kept.
+        """
         if not isinstance(item, dict):
             return
 
@@ -5145,12 +5193,25 @@ def api_lostfound_items(request: Request):
         if not iid:
             return
 
+        # IMPORTANT:
+        # do not re-merge deleted items into event history,
+        # but also do not remove existing history from store
+        if _is_deleted_item(iid):
+            return
+
         prev = store.get(iid) if isinstance(store.get(iid), dict) else {}
         merged = dict(prev)
 
         # keep earliest firstSeenTs
-        if merged.get("firstSeenTs") is None and item.get("firstSeenTs") is not None:
-            merged["firstSeenTs"] = item.get("firstSeenTs")
+        prev_first = merged.get("firstSeenTs")
+        new_first = item.get("firstSeenTs")
+        if prev_first is None and new_first is not None:
+            merged["firstSeenTs"] = new_first
+        elif prev_first is not None and new_first is not None:
+            try:
+                merged["firstSeenTs"] = min(float(prev_first), float(new_first))
+            except Exception:
+                merged["firstSeenTs"] = prev_first
 
         for k in (
             "lastSeenTs",
@@ -5192,9 +5253,10 @@ def api_lostfound_items(request: Request):
                     continue
 
                 norm = _normalize_live_item(cam_id, it, base)
-                norm["id"] = str(norm.get("id") or "")
+                norm["id"] = str(norm.get("id") or "").strip()
+                if not norm["id"]:
+                    continue
 
-                # save snapshot fields for LIVE too
                 snap = it.get("snapshot_path") or it.get("snapshot") or it.get("image_path")
                 if snap:
                     snap = str(snap)
@@ -5209,6 +5271,16 @@ def api_lostfound_items(request: Request):
                     norm["imageUrl"] = None
 
                 norm = _apply_override(norm, overrides)
+
+                # skip broken/ghost event items
+                if _should_skip_lf_event_item(norm):
+                    continue
+
+                # skip deleted item immediately for Events page,
+                # but DO NOT remove from store
+                if norm.get("deleted") is True:
+                    continue
+
                 _store_merge(norm)
                 _maybe_emit_lf_notification(norm, base)
 
@@ -5217,10 +5289,6 @@ def api_lostfound_items(request: Request):
 
     # -------------------------
     # 1B) LIVE saved items from disk
-    # IMPORTANT:
-    # read history from outputs/lost_and_found/live/<cam_id>/lost_items.json
-    # so RTSP/live cameras still show lost-item details even if pipeline
-    # memory changes or reconnect happens
     # -------------------------
     try:
         if LIVE_ROOT.exists():
@@ -5248,7 +5316,9 @@ def api_lostfound_items(request: Request):
                         continue
 
                     norm = _normalize_live_item(cam_id, it, base)
-                    norm["id"] = str(norm.get("id") or "")
+                    norm["id"] = str(norm.get("id") or "").strip()
+                    if not norm["id"]:
+                        continue
 
                     snap = it.get("snapshot_path") or it.get("snapshot") or it.get("image_path")
                     if snap:
@@ -5264,6 +5334,16 @@ def api_lostfound_items(request: Request):
                         norm["imageUrl"] = None
 
                     norm = _apply_override(norm, overrides)
+
+                    # skip broken/ghost event items
+                    if _should_skip_lf_event_item(norm):
+                        continue
+
+                    # skip deleted item immediately for Events page,
+                    # but DO NOT remove from store
+                    if norm.get("deleted") is True:
+                        continue
+
                     _store_merge(norm)
 
     except Exception:
@@ -5300,7 +5380,9 @@ def api_lostfound_items(request: Request):
                     continue
 
                 norm = _normalize_offline_item(stem, it, base)
-                norm["id"] = str(norm.get("id") or "")
+                norm["id"] = str(norm.get("id") or "").strip()
+                if not norm["id"]:
+                    continue
 
                 snap = it.get("snapshot_path") or it.get("snapshot") or it.get("image_path")
                 if snap:
@@ -5316,12 +5398,22 @@ def api_lostfound_items(request: Request):
                     norm["imageUrl"] = None
 
                 norm = _apply_override(norm, overrides)
+
+                # skip broken/ghost event items
+                if _should_skip_lf_event_item(norm):
+                    continue
+
+                # skip deleted item immediately for Events page,
+                # but DO NOT remove from store
+                if norm.get("deleted") is True:
+                    continue
+
                 _store_merge(norm)
 
     except Exception:
         pass
 
-    # persist store back to disk
+    # persist updated store back to disk
     try:
         _write_items_store(store)
     except Exception:
@@ -5337,9 +5429,19 @@ def api_lostfound_items(request: Request):
             continue
 
         item = dict(it)
-        item["id"] = str(iid)
+        item["id"] = str(iid).strip()
+        if not item["id"]:
+            continue
 
         item = _apply_override(item, overrides)
+
+        # hide deleted items from Events page
+        if item.get("deleted") is True:
+            continue
+
+        # hide broken/ghost event items from Events page
+        if _should_skip_lf_event_item(item):
+            continue
 
         snap = (
             item.get("snapshot")
@@ -5370,10 +5472,6 @@ def api_lostfound_items(request: Request):
                 image_url = None
 
         item["imageUrl"] = image_url
-
-        if item.get("deleted") is True:
-            continue
-
         unique.append(item)
 
     # -------------------------
@@ -5401,8 +5499,10 @@ def api_lf_solve_item(item_id: str):
     rec = overrides.get(item_id) or {}
     rec["status"] = "solved"
     rec["updated_at"] = int(time.time())
+    # if previously deleted, keep delete state authoritative
     overrides[item_id] = rec
     _write_overrides(overrides)
+
     return {"ok": True, "id": item_id, "status": "solved"}
 
 
@@ -5421,8 +5521,34 @@ def api_lf_update_item(item_id: str, payload: Dict[str, Any] = Body(default={}))
     rec["updated_at"] = int(time.time())
     overrides[item_id] = rec
     _write_overrides(overrides)
+
     return {"ok": True, "id": item_id, "notes": notes}
 
+def _mark_item_store_deleted(item_id: str, now_ts: int) -> bool:
+    item_id = (item_id or "").strip()
+    if not item_id:
+        return False
+
+    with _items_store_lock:
+        for p in _lf_list_shard_paths(LF_STORE_ITEMS_DIR, LF_STORE_ITEMS_PREFIX):
+            shard = _lf_load_shard(p)
+            if not isinstance(shard, dict):
+                continue
+
+            rec = shard.get(item_id)
+            if not isinstance(rec, dict):
+                continue
+
+            updated = dict(rec)
+            updated["status"] = "deleted"
+            updated["deleted"] = True
+            updated["updatedAt"] = int(now_ts)
+            shard[item_id] = updated
+
+            _lf_save_shard(p, shard)
+            return True
+
+    return False
 
 @app.delete("/api/lostfound/item/{item_id}")
 def api_lf_delete_item(item_id: str):
@@ -5430,13 +5556,61 @@ def api_lf_delete_item(item_id: str):
     if not item_id:
         raise HTTPException(status_code=400, detail="Missing item_id")
 
+    now_ts = int(time.time())
+
     overrides = _read_overrides()
     rec = overrides.get(item_id) or {}
     rec["deleted"] = True
-    rec["updated_at"] = int(time.time())
+    rec["status"] = "deleted"
+    rec["updated_at"] = now_ts
     overrides[item_id] = rec
     _write_overrides(overrides)
-    return {"ok": True, "id": item_id, "deleted": True}
+
+    _mark_item_store_deleted(item_id, now_ts)
+
+    return {
+        "ok": True,
+        "id": item_id,
+        "deleted": True,
+        "status": "deleted",
+    }
+
+def _get_lostfound_report_items(request: Request, include_deleted: bool = True):
+    base = str(request.base_url).rstrip("/")
+    overrides = _read_overrides()
+    store = _read_items_store()
+    if not isinstance(store, dict):
+        store = {}
+
+    out = []
+    for iid, it in store.items():
+        if not isinstance(it, dict):
+            continue
+
+        item = dict(it)
+        item["id"] = str(iid).strip()
+        if not item["id"]:
+            continue
+
+        item = _apply_override(item, overrides)
+
+        if not include_deleted and (
+            item.get("deleted") is True or str(item.get("status") or "").lower() == "deleted"
+        ):
+            continue
+
+        out.append(item)
+
+    out.sort(
+        key=lambda x: int(x.get("lastSeenTs") or x.get("firstSeenTs") or 0),
+        reverse=True
+    )
+    return out
+
+@app.get("/api/lostfound/reports/items")
+def api_lostfound_report_items(request: Request):
+    items = _get_lostfound_report_items(request, include_deleted=True)
+    return JSONResponse({"items": items})
 
 
 @app.on_event("shutdown")
