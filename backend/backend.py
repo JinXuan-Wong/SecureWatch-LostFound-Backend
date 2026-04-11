@@ -1887,7 +1887,7 @@ def restart_single_live_camera(cam_id: str) -> bool:
                     old_p.join(timeout=3.0)
                 _system(f"LIVE: Stopped pipeline for {cam_id}")
             except Exception as e:
-                system(f"LIVE: Error stopping pipeline for {cam_id}: {e}")
+                _system(f"LIVE: Error stopping pipeline for {cam_id}: {e}")
 
         try:
             pipelines_live.pop(cam_id, None)
@@ -1947,7 +1947,7 @@ def restart_single_live_camera(cam_id: str) -> bool:
 
             cfg = PipelineConfig(
                 camera_id=cam_id,
-                src=src,
+                src= src,
                 roi_config_path=str(roi_path),
                 num_workers=1,
                 max_skip=0.8,
@@ -1984,18 +1984,18 @@ def restart_single_live_camera(cam_id: str) -> bool:
 
             cfg = PipelineConfig(
                 camera_id=cam_id,
-                src=src,
+                src= str(src),
                 roi_config_path=str(roi_path),
                 num_workers=1,
-                max_skip=1.0,
+                max_skip=0,
 
-                desired_fps_fisheye=0.5,
-                desired_fps_normal=1.0,
-
+                desired_fps_fisheye=1.5,
+                desired_fps_normal=3.0,
                 window_scale=0.80,
                 display_fps=8.0,
+
                 show_ui=False,
-                enable_detection=detection_enabled,
+                enable_detection=True,
                 force_video_type=forced_video_type,
                 source_kind="FILE",
 
@@ -2008,11 +2008,12 @@ def restart_single_live_camera(cam_id: str) -> bool:
                 drop_old_detection_jobs=False,
                 latest_only_tracking=False,
             )
-
         # ---------------------------------
         # 7) start new pipeline
         # ---------------------------------
-        detector = _get_live_detector()
+        det_group = _live_detector_group_for_cam(cam_id)
+        cfg.detector_group = det_group
+        detector = _get_live_detector(det_group)
         new_pipeline = VideoPipeline(cfg, detector)
 
         if not new_pipeline.start():
@@ -2265,10 +2266,10 @@ def start_live_pipelines(limit_normal: int = 999, limit_fisheye: int = 999):
                 src=str(f),
                 roi_config_path=str(roi_path),
                 num_workers=1,
-                max_skip=1.0,
+                max_skip=0,
 
-                desired_fps_fisheye=0.5,
-                desired_fps_normal=1.0,
+                desired_fps_fisheye=1.5,
+                desired_fps_normal=3.0,
                 window_scale=0.80,
                 display_fps=8.0,
 
@@ -2277,9 +2278,14 @@ def start_live_pipelines(limit_normal: int = 999, limit_fisheye: int = 999):
                 force_video_type=None,
                 source_kind="FILE",
 
-                # IMPORTANT: keep upload/file light but not too aggressive
+                base_frame_skip_fisheye_rtsp=0,
+                base_frame_skip_normal_rtsp=0,
+
                 base_frame_skip_fisheye_file=0,
                 base_frame_skip_normal_file=0,
+
+                drop_old_detection_jobs=False,
+                latest_only_tracking=False,
             )
 
             det_group = _live_detector_group_for_cam(cam_id)
@@ -2307,7 +2313,7 @@ def start_live_pipelines(limit_normal: int = 999, limit_fisheye: int = 999):
                 src=rec["url"],
                 roi_config_path=str(roi_path),
                 num_workers=1,
-                max_skip=1.0,
+                max_skip=0.8,
 
                 desired_fps_fisheye=0.5,
                 desired_fps_normal=1.0,
@@ -2322,8 +2328,8 @@ def start_live_pipelines(limit_normal: int = 999, limit_fisheye: int = 999):
                 base_frame_skip_fisheye_rtsp=0,
                 base_frame_skip_normal_rtsp=0,
 
-                base_frame_skip_fisheye_file=1,
-                base_frame_skip_normal_file=1,
+                base_frame_skip_fisheye_file=0,
+                base_frame_skip_normal_file=0,
 
                 drop_old_detection_jobs=False,
                 latest_only_tracking=False,
@@ -3882,7 +3888,7 @@ def live_frame(cam_id: str, view_idx: int):
                 media_type="image/jpeg",
                 headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"},
             )
-
+    
     # -----------------------------
     # 2) FALLBACK (slow method) — supports both file path and rtsp://
     # -----------------------------
@@ -4851,9 +4857,10 @@ def _pick_status(obj: dict) -> str:
         return "solved"
     return "lost"
 
-
 def _normalize_live_item(cam_id: str, it: dict, request_base: str) -> dict:
     it = it or {}
+    raw = it.get("raw") if isinstance(it.get("raw"), dict) else it
+
     snap = it.get("snapshot_path") or it.get("snapshot") or it.get("image_path")
     snap_str = str(snap or "").strip()
 
@@ -4862,22 +4869,53 @@ def _normalize_live_item(cam_id: str, it: dict, request_base: str) -> dict:
     if raw_id:
         item_id = f"live-{cam_id}-{raw_id}"
     elif snap_str:
-        # ✅ use filename (most stable + unique)
         snap_name = Path(snap_str).name
         item_id = f"live-{cam_id}-{snap_name}"
     else:
         item_id = f"live-{cam_id}-{abs(hash(str(it)))}"
 
-    snap = it.get("snapshot_path") or it.get("snapshot") or it.get("image_path")
-
-    # ✅ IMPORTANT FIX:
-    # Do NOT override with /snapshots/{cam_id}/{name} because your live snapshots may be
-    # under outputs/lost_and_found/live/<cam_id>/snapshots (served by /lf_outputs).
     image_url = to_image_url(snap, request_base)
 
-    ts_guess = 0
-    if snap:
-        ts_guess = _ts_from_snapshot_name(str(snap))
+    # --- Extract times ---
+    try:
+        lost_time = float(raw.get("lost_time")) if raw.get("lost_time") is not None else None
+    except Exception:
+        lost_time = None
+
+    try:
+        last_attended_time = (
+            float(raw.get("last_attended_time"))
+            if raw.get("last_attended_time") is not None
+            else None
+        )
+    except Exception:
+        last_attended_time = None
+
+    try:
+        duration_before_lost = float(raw.get("duration_before_lost") or 0)
+    except Exception:
+        duration_before_lost = 0.0
+
+    # --- lastSeenTs (BEST: use lost_time) ---
+    if lost_time is not None:
+        last_seen_ts = float(lost_time)
+    else:
+        ts_guess = _ts_from_snapshot_name(str(snap)) if snap else 0
+        try:
+            last_seen_ts = float(ts_guess) if float(ts_guess) > 0 else float(time.time())
+        except Exception:
+            last_seen_ts = float(time.time())
+
+    # --- firstSeenTs (BEST: use last_attended_time) ---
+    if last_attended_time is not None:
+        first_seen_ts = float(last_attended_time)
+    else:
+        duration_sec = max(0.0, duration_before_lost)
+        first_seen_ts = float(last_seen_ts - duration_sec) if duration_sec > 0 else last_seen_ts
+
+    # safety check
+    if first_seen_ts < 0 or first_seen_ts > last_seen_ts:
+        first_seen_ts = last_seen_ts
 
     location = extract_location_from_stem(cam_id)
 
@@ -4889,8 +4927,8 @@ def _normalize_live_item(cam_id: str, it: dict, request_base: str) -> dict:
         "location": location,
         "label": _pick_label(it).replace("_", " ").title(),
         "status": _pick_status(it),
-        "firstSeenTs": ts_guess,
-        "lastSeenTs": ts_guess,
+        "firstSeenTs": first_seen_ts,
+        "lastSeenTs": last_seen_ts,
         "imageUrl": image_url,
         "raw": it,
     }
@@ -4898,7 +4936,6 @@ def _normalize_live_item(cam_id: str, it: dict, request_base: str) -> dict:
 
 def _normalize_offline_item(stem: str, it: dict, request_base: str) -> dict:
     it = it or {}
-
     raw = it.get("raw") if isinstance(it.get("raw"), dict) else it
 
     lost_id = raw.get("lost_id") or it.get("lost_id") or it.get("id") or it.get("item_id")
@@ -4911,30 +4948,64 @@ def _normalize_offline_item(stem: str, it: dict, request_base: str) -> dict:
         item_id = f"offline-{stem}-{abs(hash(snap0))}"
 
     snap = it.get("snapshot_path") or it.get("snapshot") or it.get("image_path")
-
     image_url = to_image_url(snap, request_base)
-    ts_guess = 0
-    if snap:
-        ts_guess = _ts_from_snapshot_name(str(snap))
+
+    # --- Extract times ---
+    try:
+        lost_time = float(raw.get("lost_time")) if raw.get("lost_time") is not None else None
+    except Exception:
+        lost_time = None
+
+    try:
+        last_attended_time = (
+            float(raw.get("last_attended_time"))
+            if raw.get("last_attended_time") is not None
+            else None
+        )
+    except Exception:
+        last_attended_time = None
+
+    try:
+        duration_before_lost = float(raw.get("duration_before_lost") or 0)
+    except Exception:
+        duration_before_lost = 0.0
+
+    # --- lastSeenTs ---
+    if lost_time is not None:
+        last_seen_ts = float(lost_time)
+    else:
+        ts_guess = _ts_from_snapshot_name(str(snap)) if snap else 0
+        try:
+            last_seen_ts = float(ts_guess) if float(ts_guess) > 0 else float(time.time())
+        except Exception:
+            last_seen_ts = float(time.time())
+
+    # --- firstSeenTs ---
+    if last_attended_time is not None:
+        first_seen_ts = float(last_attended_time)
+    else:
+        duration_sec = max(0.0, duration_before_lost)
+        first_seen_ts = float(last_seen_ts - duration_sec) if duration_sec > 0 else last_seen_ts
+
+    # safety check
+    if first_seen_ts < 0 or first_seen_ts > last_seen_ts:
+        first_seen_ts = last_seen_ts
 
     location = extract_location_from_stem(stem)
 
     return {
         "id": item_id,
         "module": "lost_found",
-        # keep your original value if your UI expects "upload"
-        # but "offline" is more accurate.
         "source": "upload",
         "videoId": stem,
-        "location": location,  # ✅ THIS IS WHAT UI USES
+        "location": location,
         "label": _pick_label(it).replace("_", " ").title(),
         "status": _pick_status(it),
-        "firstSeenTs": ts_guess,
-        "lastSeenTs": ts_guess,
+        "firstSeenTs": first_seen_ts,
+        "lastSeenTs": last_seen_ts,
         "imageUrl": image_url,
         "raw": raw,
     }
-
 
 def _read_json_file(p: Path) -> dict:
     try:
@@ -5599,6 +5670,35 @@ def _get_lostfound_report_items(request: Request, include_deleted: bool = True):
         ):
             continue
 
+        snap = (
+            item.get("snapshot")
+            or item.get("snapshot_path")
+            or item.get("image_path")
+        )
+
+        image_url = None
+
+        if snap:
+            try:
+                snap_str = str(snap).strip()
+                if snap_str:
+                    item["snapshot"] = snap_str
+                    item["snapshot_path"] = snap_str
+                    item["image_path"] = snap_str
+
+                    snap_path = Path(snap_str)
+                    if not snap_path.is_absolute():
+                        snap_path = (OUTPUTS_LF_DIR / snap_path).resolve()
+
+                    if snap_path.exists():
+                        try:
+                            image_url = to_image_url(str(snap_path), base)
+                        except Exception:
+                            image_url = None
+            except Exception:
+                image_url = None
+
+        item["imageUrl"] = image_url
         out.append(item)
 
     out.sort(

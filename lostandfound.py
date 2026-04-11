@@ -3331,7 +3331,7 @@ def draw_detections_with_id(img, detections):
         GAP_Y = 4
     else:                    # larger upload/file frames
         FONT_SCALE = 0.60
-        FONT_THICKNESS = 1.5
+        FONT_THICKNESS = 1
         PAD_X = 5
         PAD_Y = 4
         GAP_Y = 4
